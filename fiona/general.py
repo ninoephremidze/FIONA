@@ -966,8 +966,6 @@ class FresnelNUFFT3:
                         else:
                             k1i = np.rint(k1).astype(int)
                             k2i = np.rint(k2).astype(int)
-                            if not (np.allclose(k1, k1i) and np.allclose(k2, k2i)):
-                                raise ValueError("Non-integer k indices; enable type1_interpolate.")
                             valid = (
                                 (k1i >= -k_max) & (k1i <= k_max) &
                                 (k2i >= -k_max) & (k2i <= k_max)
