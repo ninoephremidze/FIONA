@@ -3,9 +3,11 @@
 ####################################################################
 
 ### This code computes the Fresnel integral in the x-domain.
-### In the x-domain formulation, the lens potential ψ(x) is evaluated once on
-### a fixed spatial quadrature grid and reused across frequencies. The NUFFT
-### kernel depends on w through exp(-i w y·x), so we must execute one NUFFT per
+### In the x-domain formulation, the lens potential ψ(x) is evaluated on a
+### spatial quadrature grid. When auto_R_from_gl_nodes=False, the grid is fixed
+### and ψ(x) is reused across frequencies. When auto_R_from_gl_nodes=True, the
+### grid adapts per w (so ψ(x) is recomputed per frequency). The NUFFT kernel
+### depends on w through exp(-i w y·x), so we must execute one NUFFT per
 ### frequency. To keep throughput high, each NUFFT is forced to use a single
 ### core, and frequencies are distributed across cores in parallel.
 
@@ -66,6 +68,18 @@ def _nufft2d3_call(xj, yj, cj, sk, tk, eps, isign, nthreads):
 _WORKER_CTX = None
 
 
+def _adaptive_n_gl(w_abs):
+    if w_abs <= 0.0:
+        raise ValueError("w must be nonzero for adaptive quadrature.")
+    bin_idx = int(np.floor(w_abs / 10.0)) + 1
+    bin_idx = max(1, min(10, bin_idx))
+    return bin_idx * 1000
+
+
+def _window_taper(r, R, frac):
+    return 0.5 * (1.0 - np.tanh(r - frac * R))
+
+
 def _init_worker_ctx(ctx=None):
     global _WORKER_CTX
     if ctx is not None:
@@ -75,13 +89,51 @@ def _init_worker_ctx(ctx=None):
 
 
 def _eval_frequency(w, ctx):
-    base = ctx["base"]
-    quad = ctx["quad"]
-    W = ctx["W"]
-    tile_size = ctx.get("nufft_tile_size")
-    n_sources = base.size
+    if ctx.get("adaptive"):
+        w_abs = abs(w)
+        n_gl = _adaptive_n_gl(w_abs)
+        R = np.sqrt(n_gl / (2.0 * w_abs))
+        h = np.pi / R
 
-    h = ctx["h"]
+        if ctx["coordinate_system"] == "cartesian":
+            x1, x2, W = gauss_legendre_2d(n_gl, R)
+        else:
+            if ctx["uniform_angular_sampling"]:
+                r, theta, W = gauss_legendre_polar_uniform_theta_2d(
+                    ctx["polar_radial_nodes"],
+                    ctx["polar_angular_nodes"],
+                    R,
+                )
+            else:
+                r, theta, W = gauss_legendre_polar_2d(
+                    ctx["polar_radial_nodes"],
+                    ctx["polar_angular_nodes"],
+                    R,
+                )
+            x1 = r * np.cos(theta)
+            x2 = r * np.sin(theta)
+
+        psi = ctx["lens"].psi_xy(x1, x2)
+        if ctx["window_potential"]:
+            r = np.hypot(x1, x2)
+            window = _window_taper(r, R, ctx["window_radius_fraction"])
+            psi = psi * window
+
+        quad = 0.5 * (x1 * x1 + x2 * x2)
+        base = quad - psi
+        xj = h * x1
+        yj = h * x2
+        tile_size = ctx.get("nufft_tile_max_points")
+    else:
+        base = ctx["base"]
+        quad = ctx["quad"]
+        W = ctx["W"]
+        xj = ctx["xj"]
+        yj = ctx["yj"]
+        h = ctx["h"]
+        tile_size = ctx.get("nufft_tile_size")
+
+    n_sources = base.size
     sk = (w * ctx["y1"]) / h
     tk = (w * ctx["y2"]) / h
 
@@ -97,8 +149,8 @@ def _eval_frequency(w, ctx):
             cj = np.exp(1j * phase) * W
 
         I = _nufft2d3_call(
-            ctx["xj"],
-            ctx["yj"],
+            xj,
+            yj,
             cj,
             sk,
             tk,
@@ -122,8 +174,8 @@ def _eval_frequency(w, ctx):
                 cj = np.exp(1j * phase) * W[sl]
 
             I += _nufft2d3_call(
-                ctx["xj"][sl],
-                ctx["yj"][sl],
+                xj[sl],
+                yj[sl],
                 cj,
                 sk,
                 tk,
@@ -161,7 +213,8 @@ class FresnelNUFFT3:
 
     Key ideas
     ---------
-    - x-domain integration: evaluate ψ(x) once on a fixed spatial grid.
+    - x-domain integration: evaluate ψ(x) on a spatial grid.
+      (Fixed when auto_R_from_gl_nodes=False, adaptive per w otherwise.)
     - The oscillatory kernel depends on w, so each frequency needs its own NUFFT.
     - Frequencies are parallelized across processes; each NUFFT uses one thread.
 
@@ -171,10 +224,11 @@ class FresnelNUFFT3:
         Must implement lens.psi_xy(u1, u2) with numpy broadcasting.
 
     gl_nodes_per_dim : int
-        Gauss-Legendre nodes per dimension (Cartesian). Total nodes ~ gl_nodes_per_dim^2.
+        Gauss-Legendre nodes per dimension (Cartesian) when auto_R_from_gl_nodes=False.
+        Total nodes ~ gl_nodes_per_dim^2.
 
     min_physical_radius : float
-        Physical radius R (or floor on R if auto_R_from_gl_nodes=True).
+        Physical radius R when auto_R_from_gl_nodes=False.
 
     nufft_tol : float
         FINUFFT accuracy tolerance (passed as eps=...).
@@ -184,13 +238,21 @@ class FresnelNUFFT3:
         These options are ignored in x-domain mode.
 
     auto_R_from_gl_nodes : bool
-        If True, choose R from the maximum |w| in the call using:
-            R_adapt = sqrt(gl_nodes_per_dim / (2 * w_max))
-            R = max(min_physical_radius, R_adapt)
-        If False, use R = min_physical_radius.
+        If True, use adaptive quadrature per frequency:
+          - n_gl(w) = 1000 * clip(floor(|w|/10) + 1, 1, 10)
+          - R(w) = sqrt(n_gl(w) / (2 * |w|))
+        Currently implemented only for coordinate_system='cartesian'.
+        If False, use fixed n_gl=gl_nodes_per_dim and R=min_physical_radius.
 
     use_tail_correction : bool
         If True, use the "(exp(-iwψ) - 1)" formulation and add +1 afterward.
+
+    window_potential : bool
+        If True, apply psi(x) -> psi(x) * W(x) with
+        W(x) = 0.5 * (1 - tanh(|x| - 3R/4)).
+
+    window_radius_fraction : float
+        Fraction of R used in the window center (default 0.75 for 3R/4).
 
     coordinate_system : {"cartesian", "polar"}
         Quadrature coordinate system.
@@ -234,6 +296,8 @@ class FresnelNUFFT3:
         frequency_bin_width=0.5,     # decades if log, |w| units if linear
         auto_R_from_gl_nodes=True,
         use_tail_correction=True,
+        window_potential=True,
+        window_radius_fraction=0.75,
         coordinate_system="cartesian",  # "cartesian" or "polar"
         polar_radial_nodes=None,
         polar_angular_nodes=None,
@@ -271,6 +335,10 @@ class FresnelNUFFT3:
 
         # Model/derivation options
         self.use_tail_correction = bool(use_tail_correction)
+        self.window_potential = bool(window_potential)
+        self.window_radius_fraction = float(window_radius_fraction)
+        if not (0.0 < self.window_radius_fraction < 1.0):
+            raise ValueError("window_radius_fraction must be in (0, 1).")
 
         # Coordinates
         if coordinate_system not in ("cartesian", "polar"):
@@ -383,77 +451,113 @@ class FresnelNUFFT3:
         quad_phase = (y1**2 + y2**2) / 2.0
         t_input = time.perf_counter() - t_input0
 
+        adaptive = self.auto_R_from_gl_nodes
+        if adaptive and self.coordinate_system != "cartesian":
+            raise NotImplementedError(
+                "Adaptive quadrature is currently implemented only for coordinate_system='cartesian'."
+            )
+
         t_choose0 = time.perf_counter()
-        if self.auto_R_from_gl_nodes:
-            w_use = float(np.max(np.abs(w_vec)))
-            R_adapt = np.sqrt(self.gl_nodes_per_dim / (2.0 * w_use))
-            R = max(self.min_physical_radius, float(R_adapt))
+        if adaptive:
+            R_adapt = None
+            R = None
+            h = None
         else:
             R_adapt = None
             R = self.min_physical_radius
-
-        if R <= 0.0:
-            raise ValueError("Integration radius R must be positive.")
-        h = np.pi / R
+            if R <= 0.0:
+                raise ValueError("Integration radius R must be positive.")
+            h = np.pi / R
         t_choose = time.perf_counter() - t_choose0
 
         t_quad0 = time.perf_counter()
-        if self.coordinate_system == "cartesian":
-            x1, x2, W = gauss_legendre_2d(self.gl_nodes_per_dim, R)
+        if adaptive:
+            t_quad = 0.0
+            t_pot = 0.0
+            t_scale = 0.0
+            n_sources = None
+            tile_size = None
+            tile_count = None
+            xj = None
+            yj = None
+            W = None
+            base = None
+            quad = None
         else:
-            if self.uniform_angular_sampling:
-                r, theta, W = gauss_legendre_polar_uniform_theta_2d(
-                    self.polar_radial_nodes,
-                    self.polar_angular_nodes,
-                    R,
-                )
+            if self.coordinate_system == "cartesian":
+                x1, x2, W = gauss_legendre_2d(self.gl_nodes_per_dim, R)
             else:
-                r, theta, W = gauss_legendre_polar_2d(
-                    self.polar_radial_nodes,
-                    self.polar_angular_nodes,
-                    R,
-                )
-            x1 = r * np.cos(theta)
-            x2 = r * np.sin(theta)
-        t_quad = time.perf_counter() - t_quad0
+                if self.uniform_angular_sampling:
+                    r, theta, W = gauss_legendre_polar_uniform_theta_2d(
+                        self.polar_radial_nodes,
+                        self.polar_angular_nodes,
+                        R,
+                    )
+                else:
+                    r, theta, W = gauss_legendre_polar_2d(
+                        self.polar_radial_nodes,
+                        self.polar_angular_nodes,
+                        R,
+                    )
+                x1 = r * np.cos(theta)
+                x2 = r * np.sin(theta)
+            t_quad = time.perf_counter() - t_quad0
 
-        t_pot0 = time.perf_counter()
-        psi = self.lens.psi_xy(x1, x2)
-        quad = 0.5 * (x1 * x1 + x2 * x2)
-        base = quad - psi
-        t_pot = time.perf_counter() - t_pot0
+            t_pot0 = time.perf_counter()
+            psi = self.lens.psi_xy(x1, x2)
+            if self.window_potential:
+                r = np.hypot(x1, x2)
+                window = _window_taper(r, R, self.window_radius_fraction)
+                psi = psi * window
+            quad = 0.5 * (x1 * x1 + x2 * x2)
+            base = quad - psi
+            t_pot = time.perf_counter() - t_pot0
 
-        t_scale0 = time.perf_counter()
-        xj = h * x1
-        yj = h * x2
-        t_scale = time.perf_counter() - t_scale0
+            t_scale0 = time.perf_counter()
+            xj = h * x1
+            yj = h * x2
+            t_scale = time.perf_counter() - t_scale0
 
-        n_sources = x1.size
-        tile_size = None
-        tile_count = 1
-        if self.nufft_tile_max_points is not None and n_sources > self.nufft_tile_max_points:
-            tile_size = self.nufft_tile_max_points
-            tile_count = (n_sources + tile_size - 1) // tile_size
+            n_sources = x1.size
+            tile_size = None
+            tile_count = 1
+            if self.nufft_tile_max_points is not None and n_sources > self.nufft_tile_max_points:
+                tile_size = self.nufft_tile_max_points
+                tile_count = (n_sources + tile_size - 1) // tile_size
 
         t_alloc0 = time.perf_counter()
         F_out = np.empty((len(w_vec),) + y1.shape, dtype=np.complex128)
         t_alloc = time.perf_counter() - t_alloc0
 
         ctx = {
-            "xj": xj,
-            "yj": yj,
-            "W": W,
-            "base": base,
-            "quad": quad,
+            "adaptive": adaptive,
+            "lens": self.lens,
+            "coordinate_system": self.coordinate_system,
+            "uniform_angular_sampling": self.uniform_angular_sampling,
+            "polar_radial_nodes": getattr(self, "polar_radial_nodes", None),
+            "polar_angular_nodes": getattr(self, "polar_angular_nodes", None),
+            "window_potential": self.window_potential,
+            "window_radius_fraction": self.window_radius_fraction,
+            "nufft_tile_max_points": self.nufft_tile_max_points,
             "y1": y1,
             "y2": y2,
             "quad_phase": quad_phase,
-            "h": h,
             "nufft_tol": self.nufft_tol,
             "use_tail_correction": self.use_tail_correction,
             "nufft_nthreads": self.nufft_nthreads,
-            "nufft_tile_size": tile_size,
         }
+        if not adaptive:
+            ctx.update(
+                {
+                    "xj": xj,
+                    "yj": yj,
+                    "W": W,
+                    "base": base,
+                    "quad": quad,
+                    "h": h,
+                    "nufft_tile_size": tile_size,
+                }
+            )
 
         n_w = len(w_vec)
         max_workers = os.cpu_count() or 1
@@ -495,25 +599,42 @@ class FresnelNUFFT3:
         t_total = time.perf_counter() - t_total0
 
         if verbose:
-            if self.auto_R_from_gl_nodes:
-                floored = (R > float(R_adapt) + 1e-15)
-                cap_msg = " (floored by min_physical_radius)" if floored else ""
-                r_msg = f"R={R:.6g}{cap_msg} (R_adapt={R_adapt:.6g})"
+            if adaptive:
+                w_abs = np.abs(w_vec)
+                n_gl_vec = np.array([_adaptive_n_gl(val) for val in w_abs], dtype=int)
+                R_vec = np.sqrt(n_gl_vec / (2.0 * w_abs))
+                h_vec = np.pi / R_vec
+                r_msg = (
+                    f"R in [{R_vec.min():.6g}, {R_vec.max():.6g}] | "
+                    f"n_gl in [{n_gl_vec.min()}, {n_gl_vec.max()}]"
+                )
+                h_msg = f"h in [{h_vec.min():.6g}, {h_vec.max():.6g}]"
+
+                if self.nufft_tile_max_points is None:
+                    tile_msg = "  tiling:        disabled"
+                else:
+                    n_sources_vec = n_gl_vec * n_gl_vec
+                    tile_counts = (n_sources_vec + self.nufft_tile_max_points - 1) // self.nufft_tile_max_points
+                    tile_msg = (
+                        "  tiling:        adaptive (tiles in "
+                        f"[{tile_counts.min()}, {tile_counts.max()}], "
+                        f"max_points={self.nufft_tile_max_points})"
+                    )
             else:
                 r_msg = f"R={R:.6g} (fixed)"
-
-            if tile_size is None:
-                tile_msg = "  tiling:        disabled"
-            else:
-                tile_msg = (
-                    f"  tiling:        {tile_count} tiles "
-                    f"(max_points={tile_size}, sources={n_sources})"
-                )
+                h_msg = f"h={h:.6g}"
+                if tile_size is None:
+                    tile_msg = "  tiling:        disabled"
+                else:
+                    tile_msg = (
+                        f"  tiling:        {tile_count} tiles "
+                        f"(max_points={tile_size}, sources={n_sources})"
+                    )
 
             print(
                 "[FresnelNUFFT3] x-domain path\n"
                 f"  input prep:    {_fmt_s(t_input)}\n"
-                f"  choose R/h:    {_fmt_s(t_choose)} | {r_msg}, h={h:.6g}\n"
+                f"  choose R/h:    {_fmt_s(t_choose)} | {r_msg}, {h_msg}\n"
                 f"  quadrature:    {_fmt_s(t_quad)}\n"
                 f"  lens + base:   {_fmt_s(t_pot)}\n"
                 f"  scaling:       {_fmt_s(t_scale)}\n"
