@@ -388,8 +388,9 @@ def gauss_legendre_1d(n, u_max, label="Umax", verbose=True):
         _compute_and_store_gl2d(n, u_max)
 
     p = _gl2d_paths(n, u_max)
-    x = np.memmap(p["x"], dtype=np.float64, mode="r", shape=(n,))
-    w = np.memmap(p["w"], dtype=np.float64, mode="r", shape=(n,))
+    # x and w were written with np.save (npy header), so use np.load
+    x = np.load(p["x"], mmap_mode="r")
+    w = np.load(p["w"], mmap_mode="r")
     return x, w
 
 
