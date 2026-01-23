@@ -86,17 +86,33 @@ def _nufft2d3_call(xj, yj, cj, sk, tk, eps, isign, nthreads):
 def _nufft2d1_call(xj, yj, cj, ms, mt, eps, iflag, nthreads):
     if nufft2d1 is None:
         raise RuntimeError("finufft.nufft2d1 is not available.")
+    n_modes = (int(ms), int(mt))
+    kwargs = {"isign": iflag, "eps": eps}
     if _NUFFT1_HAS_NTHREADS and nthreads is not None:
-        return nufft2d1(xj, yj, cj, ms, mt, isign=iflag, eps=eps, nthreads=int(nthreads))
-    return nufft2d1(xj, yj, cj, ms, mt, isign=iflag, eps=eps)
+        kwargs["nthreads"] = int(nthreads)
+    try:
+        return nufft2d1(xj, yj, cj, n_modes=n_modes, **kwargs)
+    except TypeError:
+        try:
+            return nufft2d1(xj, yj, cj, n_modes, **kwargs)
+        except TypeError:
+            return nufft2d1(xj, yj, cj, ms, mt, **kwargs)
 
 
 def _nufft2d1many_call(xj, yj, cj, ms, mt, eps, iflag, nthreads):
     if nufft2d1many is None:
         raise RuntimeError("finufft.nufft2d1many is not available.")
+    n_modes = (int(ms), int(mt))
+    kwargs = {"isign": iflag, "eps": eps}
     if _NUFFT1MANY_HAS_NTHREADS and nthreads is not None:
-        return nufft2d1many(xj, yj, cj, ms, mt, isign=iflag, eps=eps, nthreads=int(nthreads))
-    return nufft2d1many(xj, yj, cj, ms, mt, isign=iflag, eps=eps)
+        kwargs["nthreads"] = int(nthreads)
+    try:
+        return nufft2d1many(xj, yj, cj, n_modes=n_modes, **kwargs)
+    except TypeError:
+        try:
+            return nufft2d1many(xj, yj, cj, n_modes, **kwargs)
+        except TypeError:
+            return nufft2d1many(xj, yj, cj, ms, mt, **kwargs)
 
 
 _WORKER_CTX = None
@@ -118,6 +134,21 @@ def _window_u_taper(r, R, width_frac):
     if width_frac <= 0.0:
         return 1.0
     return 0.5 * (1.0 - np.tanh((r - R) / (width_frac * R)))
+
+
+def _validate_gl1d(x, w, n, label):
+    if x.size != n or w.size != n:
+        raise ValueError(f"GL1D size mismatch for n={n} ({label}).")
+    if not (np.isfinite(x).all() and np.isfinite(w).all()):
+        raise ValueError(
+            f"Non-finite GL1D nodes/weights detected ({label}). "
+            "Your cached GL files may be corrupted; try deleting them and rerunning."
+        )
+    if np.max(np.abs(w)) > 10.0:
+        raise ValueError(
+            f"GL1D weights out of expected range ({label}). "
+            "Cached GL files may be corrupted; try deleting them and rerunning."
+        )
 
 
 def _detect_uniform_grid(y1, y2, tol=1e-12):
@@ -801,6 +832,7 @@ class FresnelNUFFT3:
 
                 t_quad0 = time.perf_counter()
                 x_1d, w_1d = gauss_legendre_1d(n_gl, 1.0, label="R_unit", verbose=verbose)
+                _validate_gl1d(x_1d, w_1d, n_gl, "R_unit")
                 x_1d_pi = x_1d * np.pi
                 t_quad = time.perf_counter() - t_quad0
                 t_quad_total += t_quad
@@ -1023,6 +1055,7 @@ class FresnelNUFFT3:
                 t_quad0 = time.perf_counter()
                 if tile_from_1d:
                     x_1d, w_1d = gauss_legendre_1d(n_gl, 1.0, label="R_unit", verbose=verbose)
+                    _validate_gl1d(x_1d, w_1d, n_gl, "R_unit")
                     u1_base = None
                     u2_base = None
                     W_base = None
@@ -1065,6 +1098,7 @@ class FresnelNUFFT3:
                 if self.coordinate_system == "cartesian":
                     if tile_from_1d:
                         x_1d, w_1d = gauss_legendre_1d(n_gl, R, label="R", verbose=verbose)
+                        _validate_gl1d(x_1d, w_1d, n_gl, "R")
                         x1 = None
                         x2 = None
                         W = None
