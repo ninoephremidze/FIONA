@@ -89,50 +89,13 @@ def _init_worker_ctx(ctx=None):
 
 
 def _eval_frequency(w, ctx):
-    if ctx.get("adaptive"):
-        w_abs = abs(w)
-        n_gl = _adaptive_n_gl(w_abs)
-        R = np.sqrt(n_gl / (2.0 * w_abs))
-        h = np.pi / R
-
-        if ctx["coordinate_system"] == "cartesian":
-            x1, x2, W = gauss_legendre_2d(n_gl, R)
-        else:
-            if ctx["uniform_angular_sampling"]:
-                r, theta, W = gauss_legendre_polar_uniform_theta_2d(
-                    ctx["polar_radial_nodes"],
-                    ctx["polar_angular_nodes"],
-                    R,
-                )
-            else:
-                r, theta, W = gauss_legendre_polar_2d(
-                    ctx["polar_radial_nodes"],
-                    ctx["polar_angular_nodes"],
-                    R,
-                )
-            x1 = r * np.cos(theta)
-            x2 = r * np.sin(theta)
-
-        psi = ctx["lens"].psi_xy(x1, x2)
-        if ctx["window_potential"]:
-            r = np.hypot(x1, x2)
-            window = _window_taper(r, R, ctx["window_radius_fraction"])
-            psi = psi * window
-
-        quad = 0.5 * (x1 * x1 + x2 * x2)
-        base = quad - psi
-        xj = h * x1
-        yj = h * x2
-        tile_size = ctx.get("nufft_tile_max_points")
-    else:
-        base = ctx["base"]
-        quad = ctx["quad"]
-        W = ctx["W"]
-        xj = ctx["xj"]
-        yj = ctx["yj"]
-        h = ctx["h"]
-        tile_size = ctx.get("nufft_tile_size")
-
+    base = ctx["base"]
+    quad = ctx["quad"]
+    W = ctx["W"]
+    xj = ctx["xj"]
+    yj = ctx["yj"]
+    h = ctx["h"]
+    tile_size = ctx.get("nufft_tile_size")
     n_sources = base.size
     sk = (w * ctx["y1"]) / h
     tk = (w * ctx["y2"]) / h
@@ -238,9 +201,11 @@ class FresnelNUFFT3:
         These options are ignored in x-domain mode.
 
     auto_R_from_gl_nodes : bool
-        If True, use adaptive quadrature per frequency:
+        If True, use adaptive quadrature per frequency bin:
           - n_gl(w) = 1000 * clip(floor(|w|/10) + 1, 1, 10)
-          - R(w) = sqrt(n_gl(w) / (2 * |w|))
+          - R per bin is set using the smallest |w| in that bin:
+            R_bin = sqrt(n_gl / (2 * min|w|_bin))
+        All frequencies that share n_gl reuse the same quadrature grid.
         Currently implemented only for coordinate_system='cartesian'.
         If False, use fixed n_gl=gl_nodes_per_dim and R=min_physical_radius.
 
@@ -459,33 +424,53 @@ class FresnelNUFFT3:
 
         t_choose0 = time.perf_counter()
         if adaptive:
-            R_adapt = None
-            R = None
-            h = None
+            w_abs = np.abs(w_vec)
+            n_gl_vec = np.array([_adaptive_n_gl(val) for val in w_abs], dtype=int)
+            groups = {}
+            for idx, n_gl in enumerate(n_gl_vec):
+                groups.setdefault(n_gl, []).append(idx)
+            group_items = [
+                (n_gl, np.asarray(idxs, dtype=int)) for n_gl, idxs in sorted(groups.items())
+            ]
         else:
-            R_adapt = None
-            R = self.min_physical_radius
+            group_items = [(self.gl_nodes_per_dim, np.arange(len(w_vec)))]
+        t_choose = time.perf_counter() - t_choose0
+
+        t_alloc0 = time.perf_counter()
+        F_out = np.empty((len(w_vec),) + y1.shape, dtype=np.complex128)
+        t_alloc = time.perf_counter() - t_alloc0
+
+        t_quad_total = 0.0
+        t_pot_total = 0.0
+        t_scale_total = 0.0
+        t_nufft_total = 0.0
+        group_meta = []
+
+        max_workers = os.cpu_count() or 1
+        mp_ctx = None
+        start_method = None
+        if self.parallel_frequencies:
+            try:
+                mp_ctx = mp.get_context("fork")
+            except ValueError:
+                mp_ctx = mp.get_context()
+            start_method = mp_ctx.get_start_method()
+
+        for n_gl, idxs in group_items:
+            w_sub = w_vec[idxs]
+            w_abs_sub = np.abs(w_sub)
+            if adaptive:
+                w_ref = float(w_abs_sub.min())
+                R = np.sqrt(n_gl / (2.0 * w_ref))
+            else:
+                R = self.min_physical_radius
             if R <= 0.0:
                 raise ValueError("Integration radius R must be positive.")
             h = np.pi / R
-        t_choose = time.perf_counter() - t_choose0
 
-        t_quad0 = time.perf_counter()
-        if adaptive:
-            t_quad = 0.0
-            t_pot = 0.0
-            t_scale = 0.0
-            n_sources = None
-            tile_size = None
-            tile_count = None
-            xj = None
-            yj = None
-            W = None
-            base = None
-            quad = None
-        else:
+            t_quad0 = time.perf_counter()
             if self.coordinate_system == "cartesian":
-                x1, x2, W = gauss_legendre_2d(self.gl_nodes_per_dim, R)
+                x1, x2, W = gauss_legendre_2d(n_gl, R, label="R", verbose=verbose)
             else:
                 if self.uniform_angular_sampling:
                     r, theta, W = gauss_legendre_polar_uniform_theta_2d(
@@ -502,6 +487,7 @@ class FresnelNUFFT3:
                 x1 = r * np.cos(theta)
                 x2 = r * np.sin(theta)
             t_quad = time.perf_counter() - t_quad0
+            t_quad_total += t_quad
 
             t_pot0 = time.perf_counter()
             psi = self.lens.psi_xy(x1, x2)
@@ -512,11 +498,13 @@ class FresnelNUFFT3:
             quad = 0.5 * (x1 * x1 + x2 * x2)
             base = quad - psi
             t_pot = time.perf_counter() - t_pot0
+            t_pot_total += t_pot
 
             t_scale0 = time.perf_counter()
             xj = h * x1
             yj = h * x2
             t_scale = time.perf_counter() - t_scale0
+            t_scale_total += t_scale
 
             n_sources = x1.size
             tile_size = None
@@ -525,123 +513,113 @@ class FresnelNUFFT3:
                 tile_size = self.nufft_tile_max_points
                 tile_count = (n_sources + tile_size - 1) // tile_size
 
-        t_alloc0 = time.perf_counter()
-        F_out = np.empty((len(w_vec),) + y1.shape, dtype=np.complex128)
-        t_alloc = time.perf_counter() - t_alloc0
+            ctx = {
+                "xj": xj,
+                "yj": yj,
+                "W": W,
+                "base": base,
+                "quad": quad,
+                "y1": y1,
+                "y2": y2,
+                "quad_phase": quad_phase,
+                "h": h,
+                "nufft_tol": self.nufft_tol,
+                "use_tail_correction": self.use_tail_correction,
+                "nufft_nthreads": self.nufft_nthreads,
+                "nufft_tile_size": tile_size,
+            }
 
-        ctx = {
-            "adaptive": adaptive,
-            "lens": self.lens,
-            "coordinate_system": self.coordinate_system,
-            "uniform_angular_sampling": self.uniform_angular_sampling,
-            "polar_radial_nodes": getattr(self, "polar_radial_nodes", None),
-            "polar_angular_nodes": getattr(self, "polar_angular_nodes", None),
-            "window_potential": self.window_potential,
-            "window_radius_fraction": self.window_radius_fraction,
-            "nufft_tile_max_points": self.nufft_tile_max_points,
-            "y1": y1,
-            "y2": y2,
-            "quad_phase": quad_phase,
-            "nufft_tol": self.nufft_tol,
-            "use_tail_correction": self.use_tail_correction,
-            "nufft_nthreads": self.nufft_nthreads,
-        }
-        if not adaptive:
-            ctx.update(
+            n_w_sub = len(w_sub)
+            if self.nufft_workers is None:
+                n_workers = min(n_w_sub, max_workers)
+            else:
+                n_workers = min(n_w_sub, self.nufft_workers, max_workers)
+            if not self.parallel_frequencies or n_w_sub <= 1:
+                n_workers = 1
+
+            t_nufft0 = time.perf_counter()
+            if n_workers > 1:
+                if start_method == "fork":
+                    _init_worker_ctx(ctx)
+                    pool = mp_ctx.Pool(processes=n_workers, initializer=_init_worker_ctx)
+                else:
+                    pool = mp_ctx.Pool(processes=n_workers, initializer=_init_worker_ctx, initargs=(ctx,))
+                try:
+                    tasks = zip(idxs, w_sub)
+                    for idx, Fw in pool.imap_unordered(_worker_task, tasks, chunksize=1):
+                        F_out[idx] = Fw
+                finally:
+                    pool.close()
+                    pool.join()
+            else:
+                _init_worker_ctx(ctx)
+                for idx, w_i in zip(idxs, w_sub):
+                    F_out[idx] = _eval_frequency(w_i, ctx)
+            t_nufft_total += time.perf_counter() - t_nufft0
+
+            group_meta.append(
                 {
-                    "xj": xj,
-                    "yj": yj,
-                    "W": W,
-                    "base": base,
-                    "quad": quad,
-                    "h": h,
-                    "nufft_tile_size": tile_size,
+                    "n_gl": n_gl,
+                    "w_min": float(w_abs_sub.min()),
+                    "w_max": float(w_abs_sub.max()),
+                    "R": float(R),
+                    "tile_size": tile_size,
+                    "tile_count": tile_count,
+                    "n_sources": n_sources,
                 }
             )
 
-        n_w = len(w_vec)
-        max_workers = os.cpu_count() or 1
-        if self.nufft_workers is None:
-            n_workers = min(n_w, max_workers)
-        else:
-            n_workers = min(n_w, self.nufft_workers, max_workers)
-
-        if not self.parallel_frequencies or n_w <= 1:
-            n_workers = 1
-
-        t_nufft0 = time.perf_counter()
-        if n_workers > 1:
-            mp_ctx = None
-            try:
-                mp_ctx = mp.get_context("fork")
-            except ValueError:
-                mp_ctx = mp.get_context()
-
-            start_method = mp_ctx.get_start_method()
-            if start_method == "fork":
-                _init_worker_ctx(ctx)
-                pool = mp_ctx.Pool(processes=n_workers, initializer=_init_worker_ctx)
-            else:
-                pool = mp_ctx.Pool(processes=n_workers, initializer=_init_worker_ctx, initargs=(ctx,))
-
-            try:
-                for idx, Fw in pool.imap_unordered(_worker_task, enumerate(w_vec), chunksize=1):
-                    F_out[idx] = Fw
-            finally:
-                pool.close()
-                pool.join()
-        else:
-            _init_worker_ctx(ctx)
-            for i, w_i in enumerate(w_vec):
-                F_out[i] = _eval_frequency(w_i, ctx)
-
-        t_nufft = time.perf_counter() - t_nufft0
+        t_nufft = t_nufft_total
         t_total = time.perf_counter() - t_total0
 
         if verbose:
             if adaptive:
-                w_abs = np.abs(w_vec)
-                n_gl_vec = np.array([_adaptive_n_gl(val) for val in w_abs], dtype=int)
-                R_vec = np.sqrt(n_gl_vec / (2.0 * w_abs))
-                h_vec = np.pi / R_vec
+                n_gl_used = np.array([meta["n_gl"] for meta in group_meta], dtype=int)
+                R_used = np.array([meta["R"] for meta in group_meta], dtype=float)
+                h_used = np.pi / R_used
                 r_msg = (
-                    f"R in [{R_vec.min():.6g}, {R_vec.max():.6g}] | "
-                    f"n_gl in [{n_gl_vec.min()}, {n_gl_vec.max()}]"
+                    f"R in [{R_used.min():.6g}, {R_used.max():.6g}] | "
+                    f"n_gl in [{n_gl_used.min()}, {n_gl_used.max()}]"
                 )
-                h_msg = f"h in [{h_vec.min():.6g}, {h_vec.max():.6g}]"
+                h_msg = f"h in [{h_used.min():.6g}, {h_used.max():.6g}]"
+                group_msg = f"  grouping:      {_fmt_s(t_choose)} | groups={len(group_meta)}"
+                range_msg = f"  adaptive R/h:  {r_msg}, {h_msg}"
 
                 if self.nufft_tile_max_points is None:
                     tile_msg = "  tiling:        disabled"
                 else:
-                    n_sources_vec = n_gl_vec * n_gl_vec
-                    tile_counts = (n_sources_vec + self.nufft_tile_max_points - 1) // self.nufft_tile_max_points
+                    tile_counts = np.array([meta['tile_count'] for meta in group_meta], dtype=int)
                     tile_msg = (
                         "  tiling:        adaptive (tiles in "
                         f"[{tile_counts.min()}, {tile_counts.max()}], "
                         f"max_points={self.nufft_tile_max_points})"
                     )
             else:
-                r_msg = f"R={R:.6g} (fixed)"
-                h_msg = f"h={h:.6g}"
-                if tile_size is None:
+                meta = group_meta[0]
+                r_msg = f"R={meta['R']:.6g} (fixed)"
+                h_msg = f"h={np.pi / meta['R']:.6g}"
+                group_msg = f"  setup:         {_fmt_s(t_choose)}"
+                range_msg = f"  R/h:           {r_msg}, {h_msg}"
+                if meta["tile_size"] is None:
                     tile_msg = "  tiling:        disabled"
                 else:
                     tile_msg = (
-                        f"  tiling:        {tile_count} tiles "
-                        f"(max_points={tile_size}, sources={n_sources})"
+                        f"  tiling:        {meta['tile_count']} tiles "
+                        f"(max_points={meta['tile_size']}, sources={meta['n_sources']})"
                     )
 
             print(
                 "[FresnelNUFFT3] x-domain path\n"
                 f"  input prep:    {_fmt_s(t_input)}\n"
-                f"  choose R/h:    {_fmt_s(t_choose)} | {r_msg}, {h_msg}\n"
-                f"  quadrature:    {_fmt_s(t_quad)}\n"
-                f"  lens + base:   {_fmt_s(t_pot)}\n"
-                f"  scaling:       {_fmt_s(t_scale)}\n"
+                f"{group_msg}\n"
+                f"{range_msg}\n"
+                f"  quadrature:    {_fmt_s(t_quad_total)}\n"
+                f"  lens + base:   {_fmt_s(t_pot_total)}\n"
+                f"  scaling:       {_fmt_s(t_scale_total)}\n"
                 f"  alloc out:     {_fmt_s(t_alloc)}\n"
                 f"  NUFFT total:   {_fmt_s(t_nufft)}\n"
                 f"{tile_msg}\n"
-                f"  workers:       {n_workers} (nufft_nthreads={self.nufft_nthreads})\n"
+                f"  workers:       up to {max_workers} (nufft_nthreads={self.nufft_nthreads})\n"
                 f"  wall total:    {_fmt_s(t_total)}"
             )
 
