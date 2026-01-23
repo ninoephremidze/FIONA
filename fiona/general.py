@@ -250,8 +250,10 @@ def _eval_frequency(w, ctx):
             yj = ctx["yj"]
             n_sources = base.size
 
-    sk = (w * ctx["y1"]) / h
-    tk = (w * ctx["y2"]) / h
+    y1_flat = ctx.get("y1_flat", ctx.get("y1"))
+    y2_flat = ctx.get("y2_flat", ctx.get("y2"))
+    sk = (w * y1_flat) / h
+    tk = (w * y2_flat) / h
 
     if tile_size is None or n_sources <= tile_size:
         if tile_from_1d:
@@ -348,9 +350,13 @@ def _eval_frequency(w, ctx):
                 nthreads=ctx["nufft_nthreads"],
             )
 
-    Fw = np.exp(1j * w * ctx["quad_phase"]) * I * (w / (1j * _TWO_PI))
+    quad_phase = ctx.get("quad_phase_flat", ctx.get("quad_phase"))
+    Fw = np.exp(1j * w * quad_phase) * I * (w / (1j * _TWO_PI))
     if ctx["use_tail_correction"]:
         Fw = 1.0 + Fw
+    y_shape = ctx.get("y_shape")
+    if y_shape is not None and Fw.shape == (y1_flat.size,):
+        return Fw.reshape(y_shape)
     return Fw
 
 
@@ -733,6 +739,10 @@ class FresnelNUFFT3:
             raise ValueError("y1 and y2 must have the same shape.")
 
         quad_phase = (y1**2 + y2**2) / 2.0
+        y_shape = y1.shape
+        y1_flat = y1.ravel()
+        y2_flat = y2.ravel()
+        quad_phase_flat = quad_phase.ravel()
         t_input = time.perf_counter() - t_input0
 
         adaptive = self.auto_R_from_gl_nodes
@@ -759,7 +769,7 @@ class FresnelNUFFT3:
         use_type1 = (
             self.use_type1_grid
             and grid_info is not None
-            and _FINUFFT_TYPE1MANY
+            and (_FINUFFT_TYPE1MANY or _FINUFFT_TYPE1)
             and self.coordinate_system == "cartesian"
         )
         if use_type1 and len(w_vec) > 1 and not self.type1_interpolate:
@@ -835,16 +845,28 @@ class FresnelNUFFT3:
                         t_coeff_total += time.perf_counter() - t_coeff0
 
                         t_n0 = time.perf_counter()
-                        Fy = _nufft2d1many_call(
-                            xj, yj, c, Ny, Ny,
-                            eps=self.nufft_tol,
-                            iflag=self.type1_iflag,
-                            nthreads=self.nufft_nthreads,
-                        )
+                        if _FINUFFT_TYPE1MANY and len(w_chunk) > 1:
+                            Fy = _nufft2d1many_call(
+                                xj, yj, c, Ny, Ny,
+                                eps=self.nufft_tol,
+                                iflag=self.type1_iflag,
+                                nthreads=self.nufft_nthreads,
+                            )
+                            if self.type1_fftshift:
+                                Fy = np.fft.fftshift(Fy, axes=(-2, -1))
+                            Fy_total = Fy
+                        else:
+                            for t in range(len(w_chunk)):
+                                Fy_t = _nufft2d1_call(
+                                    xj, yj, c[t], Ny, Ny,
+                                    eps=self.nufft_tol,
+                                    iflag=self.type1_iflag,
+                                    nthreads=self.nufft_nthreads,
+                                )
+                                if self.type1_fftshift:
+                                    Fy_t = np.fft.fftshift(Fy_t)
+                                Fy_total[t] = Fy_t
                         t_nufft_total += time.perf_counter() - t_n0
-                        if self.type1_fftshift:
-                            Fy = np.fft.fftshift(Fy, axes=(-2, -1))
-                        Fy_total = Fy
                     else:
                         for start in range(0, n_sources, tile_size):
                             stop = min(n_sources, start + tile_size)
@@ -879,16 +901,28 @@ class FresnelNUFFT3:
                             t_coeff_total += time.perf_counter() - t_coeff0
 
                             t_n0 = time.perf_counter()
-                            Fy_tile = _nufft2d1many_call(
-                                xj_tile, yj_tile, c, Ny, Ny,
-                                eps=self.nufft_tol,
-                                iflag=self.type1_iflag,
-                                nthreads=self.nufft_nthreads,
-                            )
+                            if _FINUFFT_TYPE1MANY and len(w_chunk) > 1:
+                                Fy_tile = _nufft2d1many_call(
+                                    xj_tile, yj_tile, c, Ny, Ny,
+                                    eps=self.nufft_tol,
+                                    iflag=self.type1_iflag,
+                                    nthreads=self.nufft_nthreads,
+                                )
+                                if self.type1_fftshift:
+                                    Fy_tile = np.fft.fftshift(Fy_tile, axes=(-2, -1))
+                                Fy_total += Fy_tile
+                            else:
+                                for t in range(len(w_chunk)):
+                                    Fy_t = _nufft2d1_call(
+                                        xj_tile, yj_tile, c[t], Ny, Ny,
+                                        eps=self.nufft_tol,
+                                        iflag=self.type1_iflag,
+                                        nthreads=self.nufft_nthreads,
+                                    )
+                                    if self.type1_fftshift:
+                                        Fy_t = np.fft.fftshift(Fy_t)
+                                    Fy_total[t] += Fy_t
                             t_nufft_total += time.perf_counter() - t_n0
-                            if self.type1_fftshift:
-                                Fy_tile = np.fft.fftshift(Fy_tile, axes=(-2, -1))
-                            Fy_total += Fy_tile
 
                     for t, w_i in enumerate(w_chunk):
                         w_abs_i = abs(w_i)
@@ -1016,9 +1050,10 @@ class FresnelNUFFT3:
                     "window_radius_fraction": self.window_radius_fraction,
                     "window_u": self.window_u,
                     "window_u_width": self.window_u_width,
-                    "y1": y1,
-                    "y2": y2,
-                    "quad_phase": quad_phase,
+                    "y1_flat": y1_flat,
+                    "y2_flat": y2_flat,
+                    "quad_phase_flat": quad_phase_flat,
+                    "y_shape": y_shape,
                     "nufft_tol": self.nufft_tol,
                     "use_tail_correction": self.use_tail_correction,
                     "nufft_nthreads": self.nufft_nthreads,
@@ -1064,9 +1099,10 @@ class FresnelNUFFT3:
                         "w_1d": w_1d,
                         "x_1d_unit": False,
                         "R": R,
-                        "y1": y1,
-                        "y2": y2,
-                        "quad_phase": quad_phase,
+                        "y1_flat": y1_flat,
+                        "y2_flat": y2_flat,
+                        "quad_phase_flat": quad_phase_flat,
+                        "y_shape": y_shape,
                         "h": h,
                         "nufft_tol": self.nufft_tol,
                         "use_tail_correction": self.use_tail_correction,
@@ -1106,9 +1142,10 @@ class FresnelNUFFT3:
                         "W": W_eff,
                         "base": base,
                         "quad": quad,
-                        "y1": y1,
-                        "y2": y2,
-                        "quad_phase": quad_phase,
+                        "y1_flat": y1_flat,
+                        "y2_flat": y2_flat,
+                        "quad_phase_flat": quad_phase_flat,
+                        "y_shape": y_shape,
                         "h": h,
                         "nufft_tol": self.nufft_tol,
                         "use_tail_correction": self.use_tail_correction,
