@@ -89,13 +89,40 @@ def _init_worker_ctx(ctx=None):
 
 
 def _eval_frequency(w, ctx):
-    base = ctx["base"]
-    quad = ctx["quad"]
-    W = ctx["W"]
-    xj = ctx["xj"]
-    yj = ctx["yj"]
-    h = ctx["h"]
-    tile_size = ctx.get("nufft_tile_size")
+    if ctx.get("adaptive"):
+        w_abs = abs(w)
+        n_gl = ctx["n_gl"]
+        R = np.sqrt(n_gl / (2.0 * w_abs))
+        h = np.pi / R
+
+        u1_base = ctx["u1_base"]
+        u2_base = ctx["u2_base"]
+        W_base = ctx["W_base"]
+
+        x1 = u1_base * R
+        x2 = u2_base * R
+        W = W_base * (R * R)
+
+        psi = ctx["lens"].psi_xy(x1, x2)
+        if ctx["window_potential"]:
+            r = np.hypot(x1, x2)
+            window = _window_taper(r, R, ctx["window_radius_fraction"])
+            psi = psi * window
+
+        quad = 0.5 * (x1 * x1 + x2 * x2)
+        base = quad - psi
+        xj = h * x1
+        yj = h * x2
+        tile_size = ctx.get("nufft_tile_size")
+    else:
+        base = ctx["base"]
+        quad = ctx["quad"]
+        W = ctx["W"]
+        xj = ctx["xj"]
+        yj = ctx["yj"]
+        h = ctx["h"]
+        tile_size = ctx.get("nufft_tile_size")
+
     n_sources = base.size
     sk = (w * ctx["y1"]) / h
     tk = (w * ctx["y2"]) / h
@@ -203,9 +230,9 @@ class FresnelNUFFT3:
     auto_R_from_gl_nodes : bool
         If True, use adaptive quadrature per frequency bin:
           - n_gl(w) = 1000 * clip(floor(|w|/10) + 1, 1, 10)
-          - R per bin is set using the smallest |w| in that bin:
-            R_bin = sqrt(n_gl / (2 * min|w|_bin))
-        All frequencies that share n_gl reuse the same quadrature grid.
+          - R(w) = sqrt(n_gl / (2 * |w|))
+        Frequencies that share n_gl reuse the same *unit* Gauss–Legendre grid,
+        which is scaled per w; ψ(x) is therefore recomputed per frequency.
         Currently implemented only for coordinate_system='cartesian'.
         If False, use fixed n_gl=gl_nodes_per_dim and R=min_physical_radius.
 
@@ -460,74 +487,106 @@ class FresnelNUFFT3:
             w_sub = w_vec[idxs]
             w_abs_sub = np.abs(w_sub)
             if adaptive:
-                w_ref = float(w_abs_sub.min())
-                R = np.sqrt(n_gl / (2.0 * w_ref))
+                R = None
             else:
                 R = self.min_physical_radius
-            if R <= 0.0:
-                raise ValueError("Integration radius R must be positive.")
-            h = np.pi / R
+                if R <= 0.0:
+                    raise ValueError("Integration radius R must be positive.")
+            if adaptive:
+                n_sources = n_gl * n_gl
+                tile_size = None
+                tile_count = 1
+                if self.nufft_tile_max_points is not None and n_sources > self.nufft_tile_max_points:
+                    tile_size = self.nufft_tile_max_points
+                    tile_count = (n_sources + tile_size - 1) // tile_size
 
-            t_quad0 = time.perf_counter()
-            if self.coordinate_system == "cartesian":
-                x1, x2, W = gauss_legendre_2d(n_gl, R, label="R", verbose=verbose)
+                t_quad0 = time.perf_counter()
+                u1_base, u2_base, W_base = gauss_legendre_2d(
+                    n_gl, 1.0, label="R_unit", verbose=verbose
+                )
+                t_quad = time.perf_counter() - t_quad0
+                t_quad_total += t_quad
+
+                ctx = {
+                    "adaptive": True,
+                    "n_gl": n_gl,
+                    "u1_base": u1_base,
+                    "u2_base": u2_base,
+                    "W_base": W_base,
+                    "lens": self.lens,
+                    "window_potential": self.window_potential,
+                    "window_radius_fraction": self.window_radius_fraction,
+                    "y1": y1,
+                    "y2": y2,
+                    "quad_phase": quad_phase,
+                    "nufft_tol": self.nufft_tol,
+                    "use_tail_correction": self.use_tail_correction,
+                    "nufft_nthreads": self.nufft_nthreads,
+                    "nufft_tile_size": tile_size,
+                }
             else:
-                if self.uniform_angular_sampling:
-                    r, theta, W = gauss_legendre_polar_uniform_theta_2d(
-                        self.polar_radial_nodes,
-                        self.polar_angular_nodes,
-                        R,
-                    )
+                h = np.pi / R
+                t_quad0 = time.perf_counter()
+                if self.coordinate_system == "cartesian":
+                    x1, x2, W = gauss_legendre_2d(n_gl, R, label="R", verbose=verbose)
                 else:
-                    r, theta, W = gauss_legendre_polar_2d(
-                        self.polar_radial_nodes,
-                        self.polar_angular_nodes,
-                        R,
-                    )
-                x1 = r * np.cos(theta)
-                x2 = r * np.sin(theta)
-            t_quad = time.perf_counter() - t_quad0
-            t_quad_total += t_quad
+                    if self.uniform_angular_sampling:
+                        r, theta, W = gauss_legendre_polar_uniform_theta_2d(
+                            self.polar_radial_nodes,
+                            self.polar_angular_nodes,
+                            R,
+                        )
+                    else:
+                        r, theta, W = gauss_legendre_polar_2d(
+                            self.polar_radial_nodes,
+                            self.polar_angular_nodes,
+                            R,
+                        )
+                    x1 = r * np.cos(theta)
+                    x2 = r * np.sin(theta)
+                t_quad = time.perf_counter() - t_quad0
+                t_quad_total += t_quad
 
-            t_pot0 = time.perf_counter()
-            psi = self.lens.psi_xy(x1, x2)
-            if self.window_potential:
-                r = np.hypot(x1, x2)
-                window = _window_taper(r, R, self.window_radius_fraction)
-                psi = psi * window
-            quad = 0.5 * (x1 * x1 + x2 * x2)
-            base = quad - psi
-            t_pot = time.perf_counter() - t_pot0
-            t_pot_total += t_pot
+                t_pot0 = time.perf_counter()
+                psi = self.lens.psi_xy(x1, x2)
+                if self.window_potential:
+                    r = np.hypot(x1, x2)
+                    window = _window_taper(r, R, self.window_radius_fraction)
+                    psi = psi * window
+                quad = 0.5 * (x1 * x1 + x2 * x2)
+                base = quad - psi
+                t_pot = time.perf_counter() - t_pot0
+                t_pot_total += t_pot
 
-            t_scale0 = time.perf_counter()
-            xj = h * x1
-            yj = h * x2
-            t_scale = time.perf_counter() - t_scale0
-            t_scale_total += t_scale
+                t_scale0 = time.perf_counter()
+                xj = h * x1
+                yj = h * x2
+                t_scale = time.perf_counter() - t_scale0
+                t_scale_total += t_scale
 
-            n_sources = x1.size
-            tile_size = None
-            tile_count = 1
-            if self.nufft_tile_max_points is not None and n_sources > self.nufft_tile_max_points:
-                tile_size = self.nufft_tile_max_points
-                tile_count = (n_sources + tile_size - 1) // tile_size
+                n_sources = x1.size
+                tile_size = None
+                tile_count = 1
+                if self.nufft_tile_max_points is not None and n_sources > self.nufft_tile_max_points:
+                    tile_size = self.nufft_tile_max_points
+                    tile_count = (n_sources + tile_size - 1) // tile_size
 
-            ctx = {
-                "xj": xj,
-                "yj": yj,
-                "W": W,
-                "base": base,
-                "quad": quad,
-                "y1": y1,
-                "y2": y2,
-                "quad_phase": quad_phase,
-                "h": h,
-                "nufft_tol": self.nufft_tol,
-                "use_tail_correction": self.use_tail_correction,
-                "nufft_nthreads": self.nufft_nthreads,
-                "nufft_tile_size": tile_size,
-            }
+                ctx = {
+                    "adaptive": False,
+                    "xj": xj,
+                    "yj": yj,
+                    "W": W,
+                    "base": base,
+                    "quad": quad,
+                    "y1": y1,
+                    "y2": y2,
+                    "quad_phase": quad_phase,
+                    "h": h,
+                    "nufft_tol": self.nufft_tol,
+                    "use_tail_correction": self.use_tail_correction,
+                    "nufft_nthreads": self.nufft_nthreads,
+                    "nufft_tile_size": tile_size,
+                }
 
             n_w_sub = len(w_sub)
             if self.nufft_workers is None:
@@ -562,7 +621,8 @@ class FresnelNUFFT3:
                     "n_gl": n_gl,
                     "w_min": float(w_abs_sub.min()),
                     "w_max": float(w_abs_sub.max()),
-                    "R": float(R),
+                    "R_min": float(np.sqrt(n_gl / (2.0 * w_abs_sub.max()))) if adaptive else float(R),
+                    "R_max": float(np.sqrt(n_gl / (2.0 * w_abs_sub.min()))) if adaptive else float(R),
                     "tile_size": tile_size,
                     "tile_count": tile_count,
                     "n_sources": n_sources,
@@ -575,13 +635,17 @@ class FresnelNUFFT3:
         if verbose:
             if adaptive:
                 n_gl_used = np.array([meta["n_gl"] for meta in group_meta], dtype=int)
-                R_used = np.array([meta["R"] for meta in group_meta], dtype=float)
-                h_used = np.pi / R_used
+                R_min_used = np.array([meta["R_min"] for meta in group_meta], dtype=float)
+                R_max_used = np.array([meta["R_max"] for meta in group_meta], dtype=float)
+                R_low = float(R_min_used.min())
+                R_high = float(R_max_used.max())
+                h_low = np.pi / R_high
+                h_high = np.pi / R_low
                 r_msg = (
-                    f"R in [{R_used.min():.6g}, {R_used.max():.6g}] | "
+                    f"R in [{R_low:.6g}, {R_high:.6g}] | "
                     f"n_gl in [{n_gl_used.min()}, {n_gl_used.max()}]"
                 )
-                h_msg = f"h in [{h_used.min():.6g}, {h_used.max():.6g}]"
+                h_msg = f"h in [{h_low:.6g}, {h_high:.6g}]"
                 group_msg = f"  grouping:      {_fmt_s(t_choose)} | groups={len(group_meta)}"
                 range_msg = f"  adaptive R/h:  {r_msg}, {h_msg}"
 
