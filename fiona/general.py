@@ -78,31 +78,59 @@ def _eval_frequency(w, ctx):
     base = ctx["base"]
     quad = ctx["quad"]
     W = ctx["W"]
-
-    if ctx["use_tail_correction"]:
-        phase_base = w * base
-        phase_quad = w * quad
-        exp_base = np.exp(1j * phase_base)
-        exp_quad = np.exp(1j * phase_quad)
-        cj = (exp_base - exp_quad) * W
-    else:
-        phase = w * base
-        cj = np.exp(1j * phase) * W
+    tile_size = ctx.get("nufft_tile_size")
+    n_sources = base.size
 
     h = ctx["h"]
     sk = (w * ctx["y1"]) / h
     tk = (w * ctx["y2"]) / h
 
-    I = _nufft2d3_call(
-        ctx["xj"],
-        ctx["yj"],
-        cj,
-        sk,
-        tk,
-        eps=ctx["nufft_tol"],
-        isign=-1,
-        nthreads=ctx["nufft_nthreads"],
-    )
+    if tile_size is None or n_sources <= tile_size:
+        if ctx["use_tail_correction"]:
+            phase_base = w * base
+            phase_quad = w * quad
+            exp_base = np.exp(1j * phase_base)
+            exp_quad = np.exp(1j * phase_quad)
+            cj = (exp_base - exp_quad) * W
+        else:
+            phase = w * base
+            cj = np.exp(1j * phase) * W
+
+        I = _nufft2d3_call(
+            ctx["xj"],
+            ctx["yj"],
+            cj,
+            sk,
+            tk,
+            eps=ctx["nufft_tol"],
+            isign=-1,
+            nthreads=ctx["nufft_nthreads"],
+        )
+    else:
+        I = np.zeros_like(sk, dtype=np.complex128)
+        for start in range(0, n_sources, tile_size):
+            stop = min(n_sources, start + tile_size)
+            sl = slice(start, stop)
+            if ctx["use_tail_correction"]:
+                phase_base = w * base[sl]
+                phase_quad = w * quad[sl]
+                exp_base = np.exp(1j * phase_base)
+                exp_quad = np.exp(1j * phase_quad)
+                cj = (exp_base - exp_quad) * W[sl]
+            else:
+                phase = w * base[sl]
+                cj = np.exp(1j * phase) * W[sl]
+
+            I += _nufft2d3_call(
+                ctx["xj"][sl],
+                ctx["yj"][sl],
+                cj,
+                sk,
+                tk,
+                eps=ctx["nufft_tol"],
+                isign=-1,
+                nthreads=ctx["nufft_nthreads"],
+            )
 
     Fw = np.exp(1j * w * ctx["quad_phase"]) * I * (w / (1j * _TWO_PI))
     if ctx["use_tail_correction"]:
@@ -185,6 +213,10 @@ class FresnelNUFFT3:
     nufft_nthreads : int
         Thread count per NUFFT (passed to FINUFFT when supported, and enforced via env vars).
 
+    nufft_tile_max_points : int or None
+        If not None and the number of quadrature nodes exceeds this value, split
+        the NUFFT into tiles with at most this many sources.
+
     verbose : bool
         Print configuration and timing diagnostics.
     """
@@ -209,6 +241,7 @@ class FresnelNUFFT3:
         parallel_frequencies=True,
         nufft_workers=None,
         nufft_nthreads=1,
+        nufft_tile_max_points=4000,
         verbose=True,
     ):
         if not _FINUFFT:
@@ -310,6 +343,14 @@ class FresnelNUFFT3:
         self.nufft_nthreads = nufft_nthreads
         _set_thread_env(self.nufft_nthreads)
 
+        if nufft_tile_max_points is None:
+            self.nufft_tile_max_points = None
+        else:
+            nufft_tile_max_points = int(nufft_tile_max_points)
+            if nufft_tile_max_points < 1:
+                raise ValueError("nufft_tile_max_points must be >= 1.")
+            self.nufft_tile_max_points = nufft_tile_max_points
+
     def __call__(self, w, y1, y2, verbose=None):
         """
         Evaluate F(w, y) for frequencies w and target coordinates (y1, y2).
@@ -386,6 +427,13 @@ class FresnelNUFFT3:
         yj = h * x2
         t_scale = time.perf_counter() - t_scale0
 
+        n_sources = x1.size
+        tile_size = None
+        tile_count = 1
+        if self.nufft_tile_max_points is not None and n_sources > self.nufft_tile_max_points:
+            tile_size = self.nufft_tile_max_points
+            tile_count = (n_sources + tile_size - 1) // tile_size
+
         t_alloc0 = time.perf_counter()
         F_out = np.empty((len(w_vec),) + y1.shape, dtype=np.complex128)
         t_alloc = time.perf_counter() - t_alloc0
@@ -403,6 +451,7 @@ class FresnelNUFFT3:
             "nufft_tol": self.nufft_tol,
             "use_tail_correction": self.use_tail_correction,
             "nufft_nthreads": self.nufft_nthreads,
+            "nufft_tile_size": tile_size,
         }
 
         n_w = len(w_vec)
@@ -452,6 +501,14 @@ class FresnelNUFFT3:
             else:
                 r_msg = f"R={R:.6g} (fixed)"
 
+            if tile_size is None:
+                tile_msg = "  tiling:        disabled"
+            else:
+                tile_msg = (
+                    f"  tiling:        {tile_count} tiles "
+                    f"(max_points={tile_size}, sources={n_sources})"
+                )
+
             print(
                 "[FresnelNUFFT3] x-domain path\n"
                 f"  input prep:    {_fmt_s(t_input)}\n"
@@ -461,6 +518,7 @@ class FresnelNUFFT3:
                 f"  scaling:       {_fmt_s(t_scale)}\n"
                 f"  alloc out:     {_fmt_s(t_alloc)}\n"
                 f"  NUFFT total:   {_fmt_s(t_nufft)}\n"
+                f"{tile_msg}\n"
                 f"  workers:       {n_workers} (nufft_nthreads={self.nufft_nthreads})\n"
                 f"  wall total:    {_fmt_s(t_total)}"
             )
