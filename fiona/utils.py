@@ -365,6 +365,34 @@ def gauss_legendre_2d(n, u_max, label="Umax", verbose=True):
     return u1, u2, W
 
 
+def gauss_legendre_1d(n, u_max, label="Umax", verbose=True):
+    """
+    Load or build 1D Gauss–Legendre nodes and weights on [-u_max, u_max].
+
+    Returns:
+        x, w : memory-mapped 1D arrays of length n
+    """
+    n = int(n)
+    u_max = float(u_max)
+
+    if not _FIONA_GL2D_DIR:
+        raise RuntimeError("FIONA_GL2D_DIR is not set.")
+
+    if not _gl2d_exists(n, u_max):
+        if _FIONA_GL2D_STRICT:
+            raise FileNotFoundError(
+                f"No precomputed GL2D files for (n={n}, {label}={u_max})."
+            )
+        if verbose:
+            print(f"[FIONA] computing GL2D (n={n}, {label}={u_max})...")
+        _compute_and_store_gl2d(n, u_max)
+
+    p = _gl2d_paths(n, u_max)
+    x = np.memmap(p["x"], dtype=np.float64, mode="r", shape=(n,))
+    w = np.memmap(p["w"], dtype=np.float64, mode="r", shape=(n,))
+    return x, w
+
+
 def gauss_legendre_polar_2d(n_r, n_theta, u_max):
     """
     Load or build 2D Gauss–Legendre nodes and weights in polar coordinates.
