@@ -214,8 +214,9 @@ class FresnelNUFFT3:
         Thread count per NUFFT (passed to FINUFFT when supported, and enforced via env vars).
 
     nufft_tile_max_points : int or None
-        If not None and the number of quadrature nodes exceeds this value, split
-        the NUFFT into tiles with at most this many sources.
+        If not None and the total number of quadrature nodes (n_gl^2) exceeds
+        this value, split the NUFFT into tiles with at most this many sources.
+        Default 4000**2 corresponds to tiling when n_gl > 4000.
 
     verbose : bool
         Print configuration and timing diagnostics.
@@ -241,7 +242,7 @@ class FresnelNUFFT3:
         parallel_frequencies=True,
         nufft_workers=None,
         nufft_nthreads=1,
-        nufft_tile_max_points=4000,
+        nufft_tile_max_points=4000**2,
         verbose=True,
     ):
         if not _FINUFFT:
