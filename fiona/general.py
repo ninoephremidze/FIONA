@@ -813,7 +813,7 @@ class FresnelNUFFT3:
             and (_FINUFFT_TYPE1MANY or _FINUFFT_TYPE1)
             and self.coordinate_system == "cartesian"
         )
-        if use_type1 and len(w_vec) > 1 and not self.type1_interpolate:
+        if use_type1 and (not output_kgrid) and len(w_vec) > 1 and not self.type1_interpolate:
             use_type1 = False
         if output_kgrid and not use_type1:
             raise RuntimeError("type1_output='kgrid' requires an available type-1 grid path.")
