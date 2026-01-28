@@ -83,11 +83,13 @@ def _nufft2d3_call(xj, yj, cj, sk, tk, eps, isign, nthreads):
     return nufft2d3(xj, yj, cj, sk, tk, isign=isign, eps=eps)
 
 
-def _nufft2d1_call(xj, yj, cj, ms, mt, eps, iflag, nthreads):
+def _nufft2d1_call(xj, yj, cj, ms, mt, eps, iflag, nthreads, modeord=None):
     if nufft2d1 is None:
         raise RuntimeError("finufft.nufft2d1 is not available.")
     n_modes = (int(ms), int(mt))
     kwargs = {"isign": iflag, "eps": eps}
+    if modeord is not None:
+        kwargs["modeord"] = int(modeord)
     if _NUFFT1_HAS_NTHREADS and nthreads is not None:
         kwargs["nthreads"] = int(nthreads)
     try:
@@ -99,11 +101,13 @@ def _nufft2d1_call(xj, yj, cj, ms, mt, eps, iflag, nthreads):
             return nufft2d1(xj, yj, cj, ms, mt, **kwargs)
 
 
-def _nufft2d1many_call(xj, yj, cj, ms, mt, eps, iflag, nthreads):
+def _nufft2d1many_call(xj, yj, cj, ms, mt, eps, iflag, nthreads, modeord=None):
     if nufft2d1many is None:
         raise RuntimeError("finufft.nufft2d1many is not available.")
     n_modes = (int(ms), int(mt))
     kwargs = {"isign": iflag, "eps": eps}
+    if modeord is not None:
+        kwargs["modeord"] = int(modeord)
     if _NUFFT1MANY_HAS_NTHREADS and nthreads is not None:
         kwargs["nthreads"] = int(nthreads)
     try:
@@ -513,6 +517,10 @@ class FresnelNUFFT3:
     type1_fftshift : bool
         If True, apply fftshift to center k=0 in type-1 outputs.
 
+    type1_modeord : int
+        FINUFFT mode ordering for type-1. Use 1 for centered (CMCL) ordering
+        to match the C reference mapping k = j - N/2.
+
     type1_output : {"ygrid", "kgrid"}
         - "ygrid": evaluate on requested y1,y2 grid (interpolate if needed).
         - "kgrid": return results on the integer k-grid (C-style), with a
@@ -553,7 +561,8 @@ class FresnelNUFFT3:
         type1_interpolate=True,
         type1_max_batch=3,
         type1_iflag=1,
-        type1_fftshift=True,
+        type1_fftshift=False,
+        type1_modeord=1,
         type1_output="ygrid",
         verbose=True,
     ):
@@ -687,6 +696,9 @@ class FresnelNUFFT3:
             raise ValueError("type1_max_batch must be >= 1.")
         self.type1_iflag = int(type1_iflag)
         self.type1_fftshift = bool(type1_fftshift)
+        self.type1_modeord = int(type1_modeord)
+        if self.type1_modeord not in (0, 1):
+            raise ValueError("type1_modeord must be 0 (FFT order) or 1 (centered).")
         if type1_output not in ("ygrid", "kgrid"):
             raise ValueError("type1_output must be 'ygrid' or 'kgrid'.")
         self.type1_output = type1_output
@@ -900,6 +912,7 @@ class FresnelNUFFT3:
                                 eps=self.nufft_tol,
                                 iflag=self.type1_iflag,
                                 nthreads=self.nufft_nthreads,
+                                modeord=self.type1_modeord,
                             )
                             if self.type1_fftshift:
                                 Fy = np.fft.fftshift(Fy, axes=(-2, -1))
@@ -911,6 +924,7 @@ class FresnelNUFFT3:
                                     eps=self.nufft_tol,
                                     iflag=self.type1_iflag,
                                     nthreads=self.nufft_nthreads,
+                                    modeord=self.type1_modeord,
                                 )
                                 if self.type1_fftshift:
                                     Fy_t = np.fft.fftshift(Fy_t)
@@ -956,6 +970,7 @@ class FresnelNUFFT3:
                                     eps=self.nufft_tol,
                                     iflag=self.type1_iflag,
                                     nthreads=self.nufft_nthreads,
+                                    modeord=self.type1_modeord,
                                 )
                                 if self.type1_fftshift:
                                     Fy_tile = np.fft.fftshift(Fy_tile, axes=(-2, -1))
@@ -967,6 +982,7 @@ class FresnelNUFFT3:
                                         eps=self.nufft_tol,
                                         iflag=self.type1_iflag,
                                         nthreads=self.nufft_nthreads,
+                                        modeord=self.type1_modeord,
                                     )
                                     if self.type1_fftshift:
                                         Fy_t = np.fft.fftshift(Fy_t)
