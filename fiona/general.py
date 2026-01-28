@@ -275,22 +275,31 @@ def _type1_eval_chunk(task, ctx):
         c = np.empty((len(w_chunk), xj.size), dtype=np.complex128)
 
         t0 = time.perf_counter()
-        for t, w_i in enumerate(w_chunk):
-            w_abs_i = abs(w_i)
-            R = np.sqrt(n_gl / (2.0 * w_abs_i))
-            scale = R / np.pi
-            x_phys = xj * scale
-            y_phys = yj * scale
-            r_phys = r_pi * scale
-            psi = ctx["lens"].psi_xy(x_phys, y_phys)
-            if ctx["window_potential"]:
-                psi = psi * _window_taper(r_phys, R, ctx["window_radius_fraction"])
-            quad = 0.5 * (x_phys * x_phys + y_phys * y_phys)
-            W = W_base * (R * R)
-            if ctx["use_tail_correction"]:
-                c[t] = W * np.exp(1j * w_i * quad) * (np.exp(-1j * w_i * psi) - 1.0)
-            else:
-                c[t] = W * np.exp(1j * w_i * (quad - psi))
+        w_vec = np.asarray(w_chunk, dtype=float)
+        w2d = w_vec[:, None]
+        R_vec = np.sqrt(n_gl / (2.0 * w_vec))
+        scale = R_vec / np.pi
+        x_phys = xj[None, :] * scale[:, None]
+        y_phys = yj[None, :] * scale[:, None]
+        r_phys = r_pi[None, :] * scale[:, None]
+        psi = ctx["lens"].psi_xy(x_phys, y_phys)
+        if ctx["window_potential"]:
+            psi = psi * _window_taper(r_phys, R_vec[:, None], ctx["window_radius_fraction"])
+        quad = ne.evaluate("0.5 * (x_phys*x_phys + y_phys*y_phys)")
+        W = W_base[None, :] * (R_vec * R_vec)[:, None]
+        if ctx["use_tail_correction"]:
+            phase_quad = ne.evaluate("w2d * quad")
+            phase_lens = ne.evaluate("-w2d * psi")
+            cosq = ne.evaluate("cos(phase_quad)")
+            sinq = ne.evaluate("sin(phase_quad)")
+            cosl = ne.evaluate("cos(phase_lens)")
+            sinl = ne.evaluate("sin(phase_lens)")
+            exp_quad = cosq + 1j * sinq
+            exp_lens = cosl + 1j * sinl
+            c[:] = W * exp_quad * (exp_lens - 1.0)
+        else:
+            phase = ne.evaluate("w2d * (quad - psi)")
+            c[:] = W * (ne.evaluate("cos(phase)") + 1j * ne.evaluate("sin(phase)"))
         coeff_time += time.perf_counter() - t0
 
         t1 = time.perf_counter()
@@ -339,22 +348,31 @@ def _type1_eval_chunk(task, ctx):
             c = np.empty((len(w_chunk), stop - start), dtype=np.complex128)
 
             t0 = time.perf_counter()
-            for t, w_i in enumerate(w_chunk):
-                w_abs_i = abs(w_i)
-                R = np.sqrt(n_gl / (2.0 * w_abs_i))
-                scale = R / np.pi
-                x_phys = xj_tile * scale
-                y_phys = yj_tile * scale
-                r_phys = r_pi * scale
-                psi = ctx["lens"].psi_xy(x_phys, y_phys)
-                if ctx["window_potential"]:
-                    psi = psi * _window_taper(r_phys, R, ctx["window_radius_fraction"])
-                quad = 0.5 * (x_phys * x_phys + y_phys * y_phys)
-                W = W_base_tile * (R * R)
-                if ctx["use_tail_correction"]:
-                    c[t] = W * np.exp(1j * w_i * quad) * (np.exp(-1j * w_i * psi) - 1.0)
-                else:
-                    c[t] = W * np.exp(1j * w_i * (quad - psi))
+            w_vec = np.asarray(w_chunk, dtype=float)
+            w2d = w_vec[:, None]
+            R_vec = np.sqrt(n_gl / (2.0 * w_vec))
+            scale = R_vec / np.pi
+            x_phys = xj_tile[None, :] * scale[:, None]
+            y_phys = yj_tile[None, :] * scale[:, None]
+            r_phys = r_pi[None, :] * scale[:, None]
+            psi = ctx["lens"].psi_xy(x_phys, y_phys)
+            if ctx["window_potential"]:
+                psi = psi * _window_taper(r_phys, R_vec[:, None], ctx["window_radius_fraction"])
+            quad = ne.evaluate("0.5 * (x_phys*x_phys + y_phys*y_phys)")
+            W = W_base_tile[None, :] * (R_vec * R_vec)[:, None]
+            if ctx["use_tail_correction"]:
+                phase_quad = ne.evaluate("w2d * quad")
+                phase_lens = ne.evaluate("-w2d * psi")
+                cosq = ne.evaluate("cos(phase_quad)")
+                sinq = ne.evaluate("sin(phase_quad)")
+                cosl = ne.evaluate("cos(phase_lens)")
+                sinl = ne.evaluate("sin(phase_lens)")
+                exp_quad = cosq + 1j * sinq
+                exp_lens = cosl + 1j * sinl
+                c[:] = W * exp_quad * (exp_lens - 1.0)
+            else:
+                phase = ne.evaluate("w2d * (quad - psi)")
+                c[:] = W * (ne.evaluate("cos(phase)") + 1j * ne.evaluate("sin(phase)"))
             coeff_time += time.perf_counter() - t0
 
             t1 = time.perf_counter()
