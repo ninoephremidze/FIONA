@@ -513,6 +513,11 @@ class FresnelNUFFT3:
     type1_fftshift : bool
         If True, apply fftshift to center k=0 in type-1 outputs.
 
+    type1_output : {"ygrid", "kgrid"}
+        - "ygrid": evaluate on requested y1,y2 grid (interpolate if needed).
+        - "kgrid": return results on the integer k-grid (C-style), with a
+          y-axis for each w from y = pi*k/(w*R).
+
     verbose : bool
         Print configuration and timing diagnostics.
     """
@@ -549,6 +554,7 @@ class FresnelNUFFT3:
         type1_max_batch=3,
         type1_iflag=1,
         type1_fftshift=True,
+        type1_output="ygrid",
         verbose=True,
     ):
         if not _FINUFFT:
@@ -681,6 +687,9 @@ class FresnelNUFFT3:
             raise ValueError("type1_max_batch must be >= 1.")
         self.type1_iflag = int(type1_iflag)
         self.type1_fftshift = bool(type1_fftshift)
+        if type1_output not in ("ygrid", "kgrid"):
+            raise ValueError("type1_output must be 'ygrid' or 'kgrid'.")
+        self.type1_output = type1_output
 
     def _choose_tile_size(self, n_gl, n_sources, mode):
         if self.nufft_tile_max_points is None:
@@ -797,6 +806,7 @@ class FresnelNUFFT3:
         t_choose = time.perf_counter() - t_choose0
 
         grid_info = _detect_uniform_grid(y1, y2) if self.use_type1_grid else None
+        output_kgrid = self.type1_output == "kgrid"
         use_type1 = (
             self.use_type1_grid
             and grid_info is not None
@@ -805,6 +815,8 @@ class FresnelNUFFT3:
         )
         if use_type1 and len(w_vec) > 1 and not self.type1_interpolate:
             use_type1 = False
+        if output_kgrid and not use_type1:
+            raise RuntimeError("type1_output='kgrid' requires an available type-1 grid path.")
         if self.use_type1_grid and not use_type1 and verbose:
             print(
                 "[FresnelNUFFT3] type-1 grid path unavailable; "
@@ -813,8 +825,13 @@ class FresnelNUFFT3:
 
         if use_type1:
             t_alloc0 = time.perf_counter()
-            F_out = np.empty((len(w_vec),) + y1.shape, dtype=np.complex128)
-            t_alloc = time.perf_counter() - t_alloc0
+            if output_kgrid:
+                F_out_k = [None] * len(w_vec)
+                y_axes = [None] * len(w_vec)
+                t_alloc = time.perf_counter() - t_alloc0
+            else:
+                F_out = np.empty((len(w_vec),) + y1.shape, dtype=np.complex128)
+                t_alloc = time.perf_counter() - t_alloc0
 
             y_abs_max = float(max(np.max(np.abs(y1)), np.max(np.abs(y2))))
             t_quad_total = 0.0
@@ -961,21 +978,32 @@ class FresnelNUFFT3:
                         R = np.sqrt(n_gl / (2.0 * w_abs_i))
                         k1 = y1 * w_i * R / np.pi
                         k2 = y2 * w_i * R / np.pi
-                        if self.type1_interpolate:
-                            Iw = _interp_bilinear_grid(Fy_total[t], k1, k2, k_max)
+                        if output_kgrid:
+                            k_axis = np.arange(-k_max, k_max + 1, dtype=float)
+                            y_axis = k_axis * np.pi / (w_i * R)
+                            y1_grid, y2_grid = np.meshgrid(y_axis, y_axis, indexing="xy")
+                            quad_phase_grid = 0.5 * (y1_grid * y1_grid + y2_grid * y2_grid)
+                            val = Fy_total[t] * (w_i / (1j * _TWO_PI)) * np.exp(1j * w_i * quad_phase_grid)
+                            if self.use_tail_correction:
+                                val = 1.0 + val
+                            F_out_k[idxs[t0 + t]] = val
+                            y_axes[idxs[t0 + t]] = y_axis
                         else:
-                            k1i = np.rint(k1).astype(int)
-                            k2i = np.rint(k2).astype(int)
-                            valid = (
-                                (k1i >= -k_max) & (k1i <= k_max) &
-                                (k2i >= -k_max) & (k2i <= k_max)
-                            )
-                            Iw = np.zeros_like(k1, dtype=np.complex128)
-                            Iw[valid] = Fy_total[t][k1i[valid] + k_max, k2i[valid] + k_max]
-                        val = np.exp(1j * w_i * quad_phase) * Iw * (w_i / (1j * _TWO_PI))
-                        if self.use_tail_correction:
-                            val = 1.0 + val
-                        F_out[idxs[t0 + t]] = val
+                            if self.type1_interpolate:
+                                Iw = _interp_bilinear_grid(Fy_total[t], k1, k2, k_max)
+                            else:
+                                k1i = np.rint(k1).astype(int)
+                                k2i = np.rint(k2).astype(int)
+                                valid = (
+                                    (k1i >= -k_max) & (k1i <= k_max) &
+                                    (k2i >= -k_max) & (k2i <= k_max)
+                                )
+                                Iw = np.zeros_like(k1, dtype=np.complex128)
+                                Iw[valid] = Fy_total[t][k1i[valid] + k_max, k2i[valid] + k_max]
+                            val = np.exp(1j * w_i * quad_phase) * Iw * (w_i / (1j * _TWO_PI))
+                            if self.use_tail_correction:
+                                val = 1.0 + val
+                            F_out[idxs[t0 + t]] = val
 
                 group_meta.append(
                     {
@@ -1011,6 +1039,8 @@ class FresnelNUFFT3:
                     f"{tile_msg}\n"
                     f"  wall total:    {_fmt_s(t_total)}"
                 )
+            if output_kgrid:
+                return {"F": F_out_k, "y_axes": y_axes, "w": w_vec}
             return F_out
 
         t_alloc0 = time.perf_counter()
