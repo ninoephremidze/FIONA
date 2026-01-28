@@ -235,6 +235,188 @@ def _init_worker_ctx(ctx=None):
         _set_thread_env(_WORKER_CTX.get("nufft_nthreads"))
 
 
+_TYPE1_CTX = None
+
+
+def _init_type1_ctx(ctx=None):
+    global _TYPE1_CTX
+    if ctx is not None:
+        _TYPE1_CTX = ctx
+    if _TYPE1_CTX is not None:
+        _set_thread_env(_TYPE1_CTX.get("nufft_nthreads"))
+
+
+def _type1_task(task):
+    return _type1_eval_chunk(task, _TYPE1_CTX)
+
+
+def _type1_eval_chunk(task, ctx):
+    idxs = task["idxs"]
+    w_chunk = task["w_chunk"]
+    w_abs = np.abs(w_chunk)
+    n_gl = ctx["n_gl"]
+    tile_size = ctx["tile_size"]
+    y_abs_max = ctx["y_abs_max"]
+
+    w_max = float(w_abs.max())
+    k_max = int(np.ceil(y_abs_max * np.sqrt(n_gl * w_max / 2.0) / np.pi))
+    k_max = max(0, k_max)
+    Ny = 2 * k_max + 1
+
+    Fy_total = np.zeros((len(w_chunk), Ny, Ny), dtype=np.complex128)
+    coeff_time = 0.0
+    nufft_time = 0.0
+
+    if tile_size is None:
+        xj = ctx["xj"]
+        yj = ctx["yj"]
+        W_base = ctx["W_base"]
+        r_pi = ctx["r_pi"]
+        c = np.empty((len(w_chunk), xj.size), dtype=np.complex128)
+
+        t0 = time.perf_counter()
+        for t, w_i in enumerate(w_chunk):
+            w_abs_i = abs(w_i)
+            R = np.sqrt(n_gl / (2.0 * w_abs_i))
+            scale = R / np.pi
+            x_phys = xj * scale
+            y_phys = yj * scale
+            r_phys = r_pi * scale
+            psi = ctx["lens"].psi_xy(x_phys, y_phys)
+            if ctx["window_potential"]:
+                psi = psi * _window_taper(r_phys, R, ctx["window_radius_fraction"])
+            quad = 0.5 * (x_phys * x_phys + y_phys * y_phys)
+            W = W_base * (R * R)
+            if ctx["use_tail_correction"]:
+                c[t] = W * np.exp(1j * w_i * quad) * (np.exp(-1j * w_i * psi) - 1.0)
+            else:
+                c[t] = W * np.exp(1j * w_i * (quad - psi))
+        coeff_time += time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        if _FINUFFT_TYPE1MANY and len(w_chunk) > 1:
+            Fy = _nufft2d1many_call(
+                xj, yj, c, Ny, Ny,
+                eps=ctx["nufft_tol"],
+                iflag=ctx["type1_iflag"],
+                nthreads=ctx["nufft_nthreads"],
+                modeord=ctx["type1_modeord"],
+            )
+            if ctx["type1_fftshift"]:
+                Fy = np.fft.fftshift(Fy, axes=(-2, -1))
+            Fy_total = Fy
+        else:
+            for t in range(len(w_chunk)):
+                Fy_t = _nufft2d1_call(
+                    xj, yj, c[t], Ny, Ny,
+                    eps=ctx["nufft_tol"],
+                    iflag=ctx["type1_iflag"],
+                    nthreads=ctx["nufft_nthreads"],
+                    modeord=ctx["type1_modeord"],
+                )
+                if ctx["type1_fftshift"]:
+                    Fy_t = np.fft.fftshift(Fy_t)
+                Fy_total[t] = Fy_t
+        nufft_time += time.perf_counter() - t1
+    else:
+        x_1d = ctx["x_1d"]
+        w_1d = ctx["w_1d"]
+        x_1d_pi = x_1d * np.pi
+        M = n_gl * n_gl
+
+        for start in range(0, M, tile_size):
+            stop = min(M, start + tile_size)
+            idx = np.arange(start, stop)
+            j = idx // n_gl
+            k = idx - j * n_gl
+            xj_tile = x_1d_pi[j]
+            yj_tile = x_1d_pi[k]
+            W_base_tile = w_1d[j] * w_1d[k]
+            r_pi = np.hypot(xj_tile, yj_tile)
+            if ctx["window_u"]:
+                W_base_tile = W_base_tile * _window_u_taper(r_pi, np.pi, ctx["window_u_width"])
+
+            c = np.empty((len(w_chunk), stop - start), dtype=np.complex128)
+
+            t0 = time.perf_counter()
+            for t, w_i in enumerate(w_chunk):
+                w_abs_i = abs(w_i)
+                R = np.sqrt(n_gl / (2.0 * w_abs_i))
+                scale = R / np.pi
+                x_phys = xj_tile * scale
+                y_phys = yj_tile * scale
+                r_phys = r_pi * scale
+                psi = ctx["lens"].psi_xy(x_phys, y_phys)
+                if ctx["window_potential"]:
+                    psi = psi * _window_taper(r_phys, R, ctx["window_radius_fraction"])
+                quad = 0.5 * (x_phys * x_phys + y_phys * y_phys)
+                W = W_base_tile * (R * R)
+                if ctx["use_tail_correction"]:
+                    c[t] = W * np.exp(1j * w_i * quad) * (np.exp(-1j * w_i * psi) - 1.0)
+                else:
+                    c[t] = W * np.exp(1j * w_i * (quad - psi))
+            coeff_time += time.perf_counter() - t0
+
+            t1 = time.perf_counter()
+            if _FINUFFT_TYPE1MANY and len(w_chunk) > 1:
+                Fy_tile = _nufft2d1many_call(
+                    xj_tile, yj_tile, c, Ny, Ny,
+                    eps=ctx["nufft_tol"],
+                    iflag=ctx["type1_iflag"],
+                    nthreads=ctx["nufft_nthreads"],
+                    modeord=ctx["type1_modeord"],
+                )
+                if ctx["type1_fftshift"]:
+                    Fy_tile = np.fft.fftshift(Fy_tile, axes=(-2, -1))
+                Fy_total += Fy_tile
+            else:
+                for t in range(len(w_chunk)):
+                    Fy_t = _nufft2d1_call(
+                        xj_tile, yj_tile, c[t], Ny, Ny,
+                        eps=ctx["nufft_tol"],
+                        iflag=ctx["type1_iflag"],
+                        nthreads=ctx["nufft_nthreads"],
+                        modeord=ctx["type1_modeord"],
+                    )
+                    if ctx["type1_fftshift"]:
+                        Fy_t = np.fft.fftshift(Fy_t)
+                    Fy_total[t] += Fy_t
+            nufft_time += time.perf_counter() - t1
+
+    results = []
+    for t, w_i in enumerate(w_chunk):
+        w_abs_i = abs(w_i)
+        R = np.sqrt(n_gl / (2.0 * w_abs_i))
+        if ctx["output_kgrid"]:
+            k_axis = np.arange(-k_max, k_max + 1, dtype=float)
+            y_axis = k_axis * np.pi / (w_i * R)
+            y1_grid, y2_grid = np.meshgrid(y_axis, y_axis, indexing="xy")
+            quad_phase_grid = 0.5 * (y1_grid * y1_grid + y2_grid * y2_grid)
+            val = Fy_total[t] * (w_i / (1j * _TWO_PI)) * np.exp(1j * w_i * quad_phase_grid)
+            if ctx["use_tail_correction"]:
+                val = 1.0 + val
+            results.append((idxs[t], val, y_axis))
+        else:
+            k1 = ctx["y1"] * w_i * R / np.pi
+            k2 = ctx["y2"] * w_i * R / np.pi
+            if ctx["type1_interpolate"]:
+                Iw = _interp_bilinear_grid(Fy_total[t], k1, k2, k_max)
+            else:
+                k1i = np.rint(k1).astype(int)
+                k2i = np.rint(k2).astype(int)
+                valid = (
+                    (k1i >= -k_max) & (k1i <= k_max) &
+                    (k2i >= -k_max) & (k2i <= k_max)
+                )
+                Iw = np.zeros_like(k1, dtype=np.complex128)
+                Iw[valid] = Fy_total[t][k1i[valid] + k_max, k2i[valid] + k_max]
+            val = np.exp(1j * w_i * ctx["quad_phase"]) * Iw * (w_i / (1j * _TWO_PI))
+            if ctx["use_tail_correction"]:
+                val = 1.0 + val
+            results.append((idxs[t], val))
+
+    return results, coeff_time, nufft_time
+
 def _eval_frequency(w, ctx):
     w_abs = abs(w)
     tile_from_1d = ctx.get("tile_from_1d", False)
@@ -850,6 +1032,15 @@ class FresnelNUFFT3:
             t_coeff_total = 0.0
             t_nufft_total = 0.0
             group_meta = []
+            max_workers = os.cpu_count() or 1
+            mp_ctx = None
+            start_method = None
+            if self.parallel_frequencies:
+                try:
+                    mp_ctx = mp.get_context("fork")
+                except ValueError:
+                    mp_ctx = mp.get_context()
+                start_method = mp_ctx.get_start_method()
 
             for n_gl, idxs in group_items:
                 w_sub = w_vec[idxs]
@@ -873,153 +1064,89 @@ class FresnelNUFFT3:
                     r_pi = np.hypot(xj, yj)
                     if self.window_u:
                         W_base = W_base * _window_u_taper(r_pi, np.pi, self.window_u_width)
+                else:
+                    xj = None
+                    yj = None
+                    W_base = None
+                    r_pi = None
 
+                type1_ctx = {
+                    "n_gl": n_gl,
+                    "tile_size": tile_size,
+                    "y_abs_max": y_abs_max,
+                    "lens": self.lens,
+                    "window_potential": self.window_potential,
+                    "window_radius_fraction": self.window_radius_fraction,
+                    "window_u": self.window_u,
+                    "window_u_width": self.window_u_width,
+                    "use_tail_correction": self.use_tail_correction,
+                    "type1_iflag": self.type1_iflag,
+                    "type1_fftshift": self.type1_fftshift,
+                    "type1_modeord": self.type1_modeord,
+                    "type1_interpolate": self.type1_interpolate,
+                    "output_kgrid": output_kgrid,
+                    "nufft_tol": self.nufft_tol,
+                    "nufft_nthreads": self.nufft_nthreads,
+                    "y1": y1,
+                    "y2": y2,
+                    "quad_phase": quad_phase,
+                    "xj": xj,
+                    "yj": yj,
+                    "W_base": W_base,
+                    "r_pi": r_pi,
+                    "x_1d": x_1d,
+                    "w_1d": w_1d,
+                }
+
+                tasks = []
                 for t0 in range(0, len(w_sub), self.type1_max_batch):
+                    idx_chunk = idxs[t0:t0 + self.type1_max_batch]
                     w_chunk = w_sub[t0:t0 + self.type1_max_batch]
-                    w_abs_chunk = np.abs(w_chunk)
-                    w_max = float(w_abs_chunk.max())
-                    k_max = int(np.ceil(y_abs_max * np.sqrt(n_gl * w_max / 2.0) / np.pi))
-                    k_max = max(0, k_max)
-                    Ny = 2 * k_max + 1
+                    tasks.append({"idxs": idx_chunk, "w_chunk": w_chunk})
 
-                    Fy_total = np.zeros((len(w_chunk), Ny, Ny), dtype=np.complex128)
+                n_tasks = len(tasks)
+                if self.nufft_workers is None:
+                    n_workers = min(n_tasks, max_workers)
+                else:
+                    n_workers = min(n_tasks, self.nufft_workers, max_workers)
+                if not self.parallel_frequencies or n_tasks <= 1:
+                    n_workers = 1
 
-                    if tile_size is None:
-                        t_coeff0 = time.perf_counter()
-                        c = np.empty((len(w_chunk), n_sources), dtype=np.complex128)
-                        for t, w_i in enumerate(w_chunk):
-                            w_abs_i = abs(w_i)
-                            R = np.sqrt(n_gl / (2.0 * w_abs_i))
-                            scale = R / np.pi
-                            x_phys = xj * scale
-                            y_phys = yj * scale
-                            r_phys = r_pi * scale
-                            psi = self.lens.psi_xy(x_phys, y_phys)
-                            if self.window_potential:
-                                psi = psi * _window_taper(r_phys, R, self.window_radius_fraction)
-                            quad = 0.5 * (x_phys * x_phys + y_phys * y_phys)
-                            W = W_base * (R * R)
-                            if self.use_tail_correction:
-                                c[t] = W * np.exp(1j * w_i * quad) * (np.exp(-1j * w_i * psi) - 1.0)
-                            else:
-                                c[t] = W * np.exp(1j * w_i * (quad - psi))
-                        t_coeff_total += time.perf_counter() - t_coeff0
-
-                        t_n0 = time.perf_counter()
-                        if _FINUFFT_TYPE1MANY and len(w_chunk) > 1:
-                            Fy = _nufft2d1many_call(
-                                xj, yj, c, Ny, Ny,
-                                eps=self.nufft_tol,
-                                iflag=self.type1_iflag,
-                                nthreads=self.nufft_nthreads,
-                                modeord=self.type1_modeord,
-                            )
-                            if self.type1_fftshift:
-                                Fy = np.fft.fftshift(Fy, axes=(-2, -1))
-                            Fy_total = Fy
-                        else:
-                            for t in range(len(w_chunk)):
-                                Fy_t = _nufft2d1_call(
-                                    xj, yj, c[t], Ny, Ny,
-                                    eps=self.nufft_tol,
-                                    iflag=self.type1_iflag,
-                                    nthreads=self.nufft_nthreads,
-                                    modeord=self.type1_modeord,
-                                )
-                                if self.type1_fftshift:
-                                    Fy_t = np.fft.fftshift(Fy_t)
-                                Fy_total[t] = Fy_t
-                        t_nufft_total += time.perf_counter() - t_n0
+                if n_workers > 1:
+                    if start_method == "fork":
+                        _init_type1_ctx(type1_ctx)
+                        pool = mp_ctx.Pool(processes=n_workers, initializer=_init_type1_ctx)
                     else:
-                        for start in range(0, n_sources, tile_size):
-                            stop = min(n_sources, start + tile_size)
-                            idx = np.arange(start, stop)
-                            j = idx // n_gl
-                            k = idx - j * n_gl
-                            xj_tile = x_1d_pi[j]
-                            yj_tile = x_1d_pi[k]
-                            W_base_tile = w_1d[j] * w_1d[k]
-                            r_pi = np.hypot(xj_tile, yj_tile)
-                            if self.window_u:
-                                W_base_tile = W_base_tile * _window_u_taper(r_pi, np.pi, self.window_u_width)
-
-                            t_coeff0 = time.perf_counter()
-                            c = np.empty((len(w_chunk), stop - start), dtype=np.complex128)
-                            for t, w_i in enumerate(w_chunk):
-                                w_abs_i = abs(w_i)
-                                R = np.sqrt(n_gl / (2.0 * w_abs_i))
-                                scale = R / np.pi
-                                x_phys = xj_tile * scale
-                                y_phys = yj_tile * scale
-                                r_phys = r_pi * scale
-                                psi = self.lens.psi_xy(x_phys, y_phys)
-                                if self.window_potential:
-                                    psi = psi * _window_taper(r_phys, R, self.window_radius_fraction)
-                                quad = 0.5 * (x_phys * x_phys + y_phys * y_phys)
-                                W = W_base_tile * (R * R)
-                                if self.use_tail_correction:
-                                    c[t] = W * np.exp(1j * w_i * quad) * (np.exp(-1j * w_i * psi) - 1.0)
+                        pool = mp_ctx.Pool(processes=n_workers, initializer=_init_type1_ctx, initargs=(type1_ctx,))
+                    try:
+                        for res, coeff_t, nufft_t in pool.imap_unordered(_type1_task, tasks, chunksize=1):
+                            t_coeff_total += coeff_t
+                            t_nufft_total += nufft_t
+                            for item in res:
+                                if output_kgrid:
+                                    idx, val, y_axis = item
+                                    F_out_k[idx] = val
+                                    y_axes[idx] = y_axis
                                 else:
-                                    c[t] = W * np.exp(1j * w_i * (quad - psi))
-                            t_coeff_total += time.perf_counter() - t_coeff0
-
-                            t_n0 = time.perf_counter()
-                            if _FINUFFT_TYPE1MANY and len(w_chunk) > 1:
-                                Fy_tile = _nufft2d1many_call(
-                                    xj_tile, yj_tile, c, Ny, Ny,
-                                    eps=self.nufft_tol,
-                                    iflag=self.type1_iflag,
-                                    nthreads=self.nufft_nthreads,
-                                    modeord=self.type1_modeord,
-                                )
-                                if self.type1_fftshift:
-                                    Fy_tile = np.fft.fftshift(Fy_tile, axes=(-2, -1))
-                                Fy_total += Fy_tile
+                                    idx, val = item
+                                    F_out[idx] = val
+                    finally:
+                        pool.close()
+                        pool.join()
+                else:
+                    _init_type1_ctx(type1_ctx)
+                    for task in tasks:
+                        res, coeff_t, nufft_t = _type1_eval_chunk(task, type1_ctx)
+                        t_coeff_total += coeff_t
+                        t_nufft_total += nufft_t
+                        for item in res:
+                            if output_kgrid:
+                                idx, val, y_axis = item
+                                F_out_k[idx] = val
+                                y_axes[idx] = y_axis
                             else:
-                                for t in range(len(w_chunk)):
-                                    Fy_t = _nufft2d1_call(
-                                        xj_tile, yj_tile, c[t], Ny, Ny,
-                                        eps=self.nufft_tol,
-                                        iflag=self.type1_iflag,
-                                        nthreads=self.nufft_nthreads,
-                                        modeord=self.type1_modeord,
-                                    )
-                                    if self.type1_fftshift:
-                                        Fy_t = np.fft.fftshift(Fy_t)
-                                    Fy_total[t] += Fy_t
-                            t_nufft_total += time.perf_counter() - t_n0
-
-                    for t, w_i in enumerate(w_chunk):
-                        w_abs_i = abs(w_i)
-                        R = np.sqrt(n_gl / (2.0 * w_abs_i))
-                        k1 = y1 * w_i * R / np.pi
-                        k2 = y2 * w_i * R / np.pi
-                        if output_kgrid:
-                            k_axis = np.arange(-k_max, k_max + 1, dtype=float)
-                            y_axis = k_axis * np.pi / (w_i * R)
-                            y1_grid, y2_grid = np.meshgrid(y_axis, y_axis, indexing="xy")
-                            quad_phase_grid = 0.5 * (y1_grid * y1_grid + y2_grid * y2_grid)
-                            val = Fy_total[t] * (w_i / (1j * _TWO_PI)) * np.exp(1j * w_i * quad_phase_grid)
-                            if self.use_tail_correction:
-                                val = 1.0 + val
-                            F_out_k[idxs[t0 + t]] = val
-                            y_axes[idxs[t0 + t]] = y_axis
-                        else:
-                            if self.type1_interpolate:
-                                Iw = _interp_bilinear_grid(Fy_total[t], k1, k2, k_max)
-                            else:
-                                k1i = np.rint(k1).astype(int)
-                                k2i = np.rint(k2).astype(int)
-                                valid = (
-                                    (k1i >= -k_max) & (k1i <= k_max) &
-                                    (k2i >= -k_max) & (k2i <= k_max)
-                                )
-                                Iw = np.zeros_like(k1, dtype=np.complex128)
-                                Iw[valid] = Fy_total[t][k1i[valid] + k_max, k2i[valid] + k_max]
-                            val = np.exp(1j * w_i * quad_phase) * Iw * (w_i / (1j * _TWO_PI))
-                            if self.use_tail_correction:
-                                val = 1.0 + val
-                            F_out[idxs[t0 + t]] = val
+                                idx, val = item
+                                F_out[idx] = val
 
                 group_meta.append(
                     {
