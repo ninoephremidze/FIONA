@@ -27,9 +27,16 @@ from .lenses import (
     NFW_ELLIPSE_POTENTIAL,
 )
 
-from .axisym import FresnelNUFHT
+from .axisym import (
+    FresnelNUFHT,
+    FresnelHankelAxisymmetricTrapezoidal,
+    FresnelHankelAxisymmetricSciPy,
+)
 from .general import FresnelNUFFT3
 from .utils import CPUTracker
+
+# Backward compatibility alias
+FresnelHankelAxisymmetric = FresnelNUFHT
 
 __all__ = [
     # Base lenses
@@ -63,6 +70,9 @@ __all__ = [
 
     # Axisymmetric solvers
     "FresnelNUFHT",
+    "FresnelHankelAxisymmetric",  # Alias for FresnelNUFHT
+    "FresnelHankelAxisymmetricTrapezoidal",
+    "FresnelHankelAxisymmetricSciPy",
 
     # 2-D solvers
     "FresnelNUFFT3",
