@@ -8,6 +8,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+# Threshold for considering a magnitude as effectively zero
+MAGNITUDE_THRESHOLD = 1e-12
+
+
 def plot_overlays_ws(
     w_grid,
     F_fiona,
@@ -16,6 +20,8 @@ def plot_overlays_ws(
     Umax,
     title="Comparison",
     align_phase=False,
+    fontsize=14,
+    fontweight='bold',
 ):
     """
     Plot overlays comparing FIONA and GLoW results in frequency domain.
@@ -36,6 +42,10 @@ def plot_overlays_ws(
         Plot title
     align_phase : bool, optional
         If True, align phases between FIONA and GLoW for better comparison
+    fontsize : int, optional
+        Font size for the main title (default: 14)
+    fontweight : str, optional
+        Font weight for the main title (default: 'bold')
     """
     # Convert to numpy arrays
     w_grid = np.asarray(w_grid)
@@ -45,13 +55,13 @@ def plot_overlays_ws(
     # Optionally align phases
     if align_phase:
         # Find a common phase offset at the first point with sufficient magnitude
-        if np.abs(F_glow[0]) > 1e-12 and np.abs(F_fiona[0]) > 1e-12:
+        if np.abs(F_glow[0]) > MAGNITUDE_THRESHOLD and np.abs(F_fiona[0]) > MAGNITUDE_THRESHOLD:
             phase_offset = np.angle(F_glow[0]) - np.angle(F_fiona[0])
             F_fiona = F_fiona * np.exp(1j * phase_offset)
 
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f"{title} (n={n}, Umax={Umax})", fontsize=14, fontweight='bold')
+    fig.suptitle(f"{title} (n={n}, Umax={Umax})", fontsize=fontsize, fontweight=fontweight)
 
     # Amplitude comparison
     ax = axes[0, 0]
@@ -82,12 +92,12 @@ def plot_overlays_ws(
         np.abs(abs_fiona - abs_glow),
         abs_glow,
         out=np.zeros_like(abs_glow),
-        where=abs_glow > 1e-12
+        where=abs_glow > MAGNITUDE_THRESHOLD
     )
     ax.loglog(w_grid, rel_amp_error, 'g-', linewidth=2)
     ax.set_xlabel('Frequency w')
     ax.set_ylabel('Relative Amplitude Error')
-    ax.set_title('|F_FIONA| - |F_GLoW| / |F_GLoW|')
+    ax.set_title('(|F_FIONA| - |F_GLoW|) / |F_GLoW|')
     ax.grid(True, alpha=0.3)
 
     # Phase difference
