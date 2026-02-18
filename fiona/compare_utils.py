@@ -44,9 +44,10 @@ def plot_overlays_ws(
 
     # Optionally align phases
     if align_phase:
-        # Find a common phase offset at the first point
-        phase_offset = np.angle(F_glow[0]) - np.angle(F_fiona[0])
-        F_fiona = F_fiona * np.exp(1j * phase_offset)
+        # Find a common phase offset at the first point with sufficient magnitude
+        if np.abs(F_glow[0]) > 1e-12 and np.abs(F_fiona[0]) > 1e-12:
+            phase_offset = np.angle(F_glow[0]) - np.angle(F_fiona[0])
+            F_fiona = F_fiona * np.exp(1j * phase_offset)
 
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -72,9 +73,17 @@ def plot_overlays_ws(
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Relative amplitude error
+    # Relative amplitude error (handle zero denominators)
     ax = axes[1, 0]
-    rel_amp_error = np.abs((np.abs(F_fiona) - np.abs(F_glow)) / np.abs(F_glow))
+    abs_glow = np.abs(F_glow)
+    abs_fiona = np.abs(F_fiona)
+    # Use numpy.divide with where clause to safely handle zeros
+    rel_amp_error = np.divide(
+        np.abs(abs_fiona - abs_glow),
+        abs_glow,
+        out=np.zeros_like(abs_glow),
+        where=abs_glow > 1e-12
+    )
     ax.loglog(w_grid, rel_amp_error, 'g-', linewidth=2)
     ax.set_xlabel('Frequency w')
     ax.set_ylabel('Relative Amplitude Error')
