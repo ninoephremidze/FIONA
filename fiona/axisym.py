@@ -7,7 +7,8 @@ from pathlib import Path
 import time
 
 from .lenses import AxisymmetricLens
-from .utils import CPUTracker
+from .utils import CPUTracker, gauss_legendre_1d
+import os
 
 _HAS_SCIPY_FHT = False
 _SCIPY_FHT_ERR = None
@@ -41,25 +42,43 @@ def _pct(part, total):
 # ----------------------------------------------------------------------
 class FresnelNUFHT:
     """
-    Fresnel integral for axisymmetric lenses using **precomputed GL nodes**
+    Fresnel integral for axisymmetric lenses using Gauss-Legendre nodes
     and **FastHankelTransform NUFHT**.
 
-    Precomputed files must exist:
-
-        {GL_DIR}/gl2d_n{n_gl}_U{Umax}.x.npy
-        {GL_DIR}/gl2d_n{n_gl}_U{Umax}.w.npy
+    GL nodes are loaded from precomputed files if available, or computed
+    on-the-fly and saved to disk (via gauss_legendre_1d from utils.py).
 
     We discard x<0 (symmetry) and use:
         rs = x[x>0]
         u_weights = rs * w[x>0]
+
+    Parameters
+    ----------
+    lens : AxisymmetricLens
+        Axisymmetric lens object with psi_r method.
+    gl_nodes_per_dim : int
+        Number of Gauss-Legendre nodes per dimension.
+    min_physical_radius : float
+        Minimum physical radius (Umax) to use.
+    auto_R_from_gl_nodes : bool
+        If True, adapt Umax based on frequency range.
+        If False, use fixed min_physical_radius.
+    gl_dir : str or None
+        Directory for GL node files. If None, uses FIONA_GL2D_DIR env var.
+    tol : float
+        Tolerance for NUFHT.
     """
 
     def __init__(self,
                  lens: AxisymmetricLens,
-                 n_gl: int,
-                 Umax: float,
-                 gl_dir: str,
-                 tol: float = 1e-12):
+                 gl_nodes_per_dim: int = None,
+                 min_physical_radius: float = None,
+                 auto_R_from_gl_nodes: bool = True,
+                 gl_dir: str = None,
+                 tol: float = 1e-12,
+                 # Deprecated parameters for backward compatibility
+                 n_gl: int = None,
+                 Umax: float = None):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelHankelAxisymmetric requires AxisymmetricLens")
@@ -68,30 +87,67 @@ class FresnelNUFHT:
             raise ImportError("NUFHT C extension (_pynufht) cannot be loaded: "
                               f"{_FHT_ERR!r}")
 
+        # Handle backward compatibility for old parameter names
+        if n_gl is not None:
+            if gl_nodes_per_dim is not None:
+                raise ValueError("Cannot specify both n_gl and gl_nodes_per_dim")
+            gl_nodes_per_dim = n_gl
+        if Umax is not None:
+            if min_physical_radius is not None:
+                raise ValueError("Cannot specify both Umax and min_physical_radius")
+            min_physical_radius = Umax
+            # If old Umax is specified, default to no auto-adaptation for backward compat
+            if n_gl is not None:  # Both old params specified
+                auto_R_from_gl_nodes = False
+
+        # Set defaults if still None
+        if gl_nodes_per_dim is None:
+            gl_nodes_per_dim = 128
+        if min_physical_radius is None:
+            min_physical_radius = 1.0
+
         self.lens = lens
-        self.n_gl = int(n_gl)
-        self.Umax = float(Umax)
+        self.gl_nodes_per_dim = int(gl_nodes_per_dim)
+        self.min_physical_radius = float(min_physical_radius)
+        self.auto_R_from_gl_nodes = bool(auto_R_from_gl_nodes)
         self.tol = float(tol)
 
-        # Load precomputed GL nodes
-        gl_dir = Path(gl_dir)
-        x_path = gl_dir / f"gl2d_n{n_gl}_U{int(Umax)}.x.npy"
-        w_path = gl_dir / f"gl2d_n{n_gl}_U{int(Umax)}.w.npy"
+        # Store gl_dir for later use
+        if gl_dir is None:
+            gl_dir = os.environ.get("FIONA_GL2D_DIR", "")
+            if not gl_dir:
+                raise RuntimeError(
+                    "gl_dir not provided and FIONA_GL2D_DIR environment variable not set."
+                )
+        self._gl_dir = gl_dir
 
-        if not x_path.exists() or not w_path.exists():
-            raise FileNotFoundError(f"Missing GL files:\n  {x_path}\n  {w_path}")
+        # Don't load nodes yet - will be loaded in __call__ based on frequency range
 
-        x = np.load(x_path)
-        w = np.load(w_path)
+    def _load_gl_nodes(self, Umax):
+        """
+        Load or compute GL nodes for given Umax.
+        Uses gauss_legendre_1d from utils, which computes on-the-fly if needed.
+        """
+        # Set FIONA_GL2D_DIR temporarily if needed
+        old_env = os.environ.get("FIONA_GL2D_DIR")
+        try:
+            os.environ["FIONA_GL2D_DIR"] = self._gl_dir
+            
+            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Umax)
+            
+            # Keep only positive u (symmetry of Gauss–Legendre)
+            mask = x > 0
+            rs = x[mask]          # u_k
+            du = w[mask]          # Δu_k
+            u_weights = rs * du   # u_k Δu_k for ∫ u f(u) du
 
-        # Keep only positive u (symmetry of Gauss–Legendre)
-        mask = x > 0
-        rs = x[mask]          # u_k
-        du = w[mask]          # Δu_k
-        u_weights = rs * du   # u_k Δu_k for ∫ u f(u) du
-
-        self._rs = rs.astype(float)
-        self._u_weights = u_weights.astype(float)
+            return rs.astype(float), u_weights.astype(float)
+        finally:
+            # Restore old environment variable
+            if old_env is None:
+                os.environ.pop("FIONA_GL2D_DIR", None)
+            else:
+                os.environ["FIONA_GL2D_DIR"] = old_env
 
     # ------------------------------------------------------------------
     # Main evaluation
@@ -105,8 +161,18 @@ class FresnelNUFHT:
         if np.any(w_vec == 0):
             raise ValueError("All w must be nonzero.")
 
-        rs = self._rs
-        u_weights = self._u_weights
+        # Determine Umax based on frequency range
+        if self.auto_R_from_gl_nodes:
+            w_use = float(np.max(np.abs(w_vec)))
+            if w_use <= 0:
+                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
+            Umax_adapt = np.sqrt(self.gl_nodes_per_dim / (2.0 * w_use))
+            Umax = max(self.min_physical_radius, float(Umax_adapt))
+        else:
+            Umax = self.min_physical_radius
+
+        # Load GL nodes for this Umax
+        rs, u_weights = self._load_gl_nodes(Umax)
 
         nu = 0
         tol = self.tol
@@ -344,12 +410,30 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
     nufht(ν, r_k, c_k, y_j) then returns the vector of Hankel sums
     g_j ≈ ∑_k c_k J_ν(y_j r_k).  We have to perform a zeroth-order FHT (ν=0).
+
+    Parameters
+    ----------
+    lens : AxisymmetricLens
+        Axisymmetric lens object with psi_r method.
+    n_r : int
+        Number of radial grid points.
+    min_physical_radius : float
+        Minimum physical radius (Umax) to use.
+    auto_R_from_gl_nodes : bool
+        If True, adapt Umax based on frequency range.
+        If False, use fixed min_physical_radius.
+        Note: For this class we use n_r instead of gl_nodes_per_dim in the formula.
+    tol : float
+        Tolerance for NUFHT.
     """
 
     def __init__(self, lens: AxisymmetricLens,
                  n_r: int = 1024,
-                 Umax: float = 50.0,
-                 tol: float = 1e-12):
+                 min_physical_radius: float = None,
+                 auto_R_from_gl_nodes: bool = False,
+                 tol: float = 1e-12,
+                 # Deprecated parameter for backward compatibility
+                 Umax: float = None):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError(
@@ -362,18 +446,30 @@ class FresnelHankelAxisymmetricTrapezoidal:
                 f"Original import error: {_FHT_ERR!r}"
             )
 
+        # Handle backward compatibility for old parameter name
+        if Umax is not None:
+            if min_physical_radius is not None:
+                raise ValueError("Cannot specify both Umax and min_physical_radius")
+            min_physical_radius = Umax
+            # If old Umax is specified, default to no auto-adaptation for backward compat
+            auto_R_from_gl_nodes = False
+
+        # Set default if still None
+        if min_physical_radius is None:
+            min_physical_radius = 50.0
+
         self.lens = lens
         self.n_r = int(n_r)
-        self.Umax = float(Umax)
+        self.min_physical_radius = float(min_physical_radius)
+        self.auto_R_from_gl_nodes = bool(auto_R_from_gl_nodes)
         self.tol = float(tol)
 
-        # Build radial grid r_k and weights w_k for ∫_0^{Umax} u f(u) du.
-        self._rs, self._u_weights = self._build_radial_grid()
+        # Don't build grid yet - will be built in __call__ based on frequency range
 
     # ------------------------------------------------------------------
     # Radial grid and quadrature weights
     # ------------------------------------------------------------------
-    def _build_radial_grid(self):
+    def _build_radial_grid(self, Umax):
         """
         Simple uniform radial grid on (0, Umax] with trapezoidal weights.
 
@@ -381,7 +477,6 @@ class FresnelHankelAxisymmetricTrapezoidal:
         interval [0, r_min] is negligible for sufficiently large n_r.
         """
         n = self.n_r
-        Umax = self.Umax
 
         # n+1 points from 0 to Umax, then drop the first (0).
         rs_full = np.linspace(0.0, Umax, n + 1, dtype=float)
@@ -408,8 +503,19 @@ class FresnelHankelAxisymmetricTrapezoidal:
         if np.any(w_vec == 0.0):
             raise ValueError("All w must be nonzero.")
 
-        rs = self._rs                # u_k
-        u_weights = self._u_weights  # u_k Δu_k
+        # Determine Umax based on frequency range
+        if self.auto_R_from_gl_nodes:
+            w_use = float(np.max(np.abs(w_vec)))
+            if w_use <= 0:
+                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
+            # Use n_r as the node count for the adaptation formula
+            Umax_adapt = np.sqrt(self.n_r / (2.0 * w_use))
+            Umax = max(self.min_physical_radius, float(Umax_adapt))
+        else:
+            Umax = self.min_physical_radius
+
+        # Build radial grid for this Umax
+        rs, u_weights = self._build_radial_grid(Umax)
 
         nu = 0                       # J_0 Hankel transform
         tol = self.tol
@@ -625,17 +731,40 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
 class FresnelHankelAxisymmetricSciPy:
     """
-    Fresnel integral for axisymmetric lenses using **precomputed GL nodes**
-    for configuration (n_gl, Umax), but performing the Hankel transform with
-    SciPy's FFTLog-based fast Hankel transform (scipy.fft.fht).
+    Fresnel integral for axisymmetric lenses using Gauss-Legendre nodes
+    for configuration (gl_nodes_per_dim, Umax), and performing the Hankel
+    transform with SciPy's FFTLog-based fast Hankel transform (scipy.fft.fht).
+
+    GL nodes are loaded from precomputed files if available, or computed
+    on-the-fly and saved to disk (via gauss_legendre_1d from utils.py).
+
+    Parameters
+    ----------
+    lens : AxisymmetricLens
+        Axisymmetric lens object with psi_r method.
+    gl_nodes_per_dim : int
+        Number of Gauss-Legendre nodes per dimension.
+    min_physical_radius : float
+        Minimum physical radius (Umax) to use.
+    auto_R_from_gl_nodes : bool
+        If True, adapt Umax based on frequency range.
+        If False, use fixed min_physical_radius.
+    gl_dir : str or None
+        Directory for GL node files. If None, uses FIONA_GL2D_DIR env var.
+    tol : float
+        Tolerance for computation.
     """
 
     def __init__(self,
                  lens: AxisymmetricLens,
-                 n_gl: int,
-                 Umax: float,
-                 gl_dir: str,
-                 tol: float = 1e-12):
+                 gl_nodes_per_dim: int = None,
+                 min_physical_radius: float = None,
+                 auto_R_from_gl_nodes: bool = True,
+                 gl_dir: str = None,
+                 tol: float = 1e-12,
+                 # Deprecated parameters for backward compatibility
+                 n_gl: int = None,
+                 Umax: float = None):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelHankelAxisymmetricSciPy requires AxisymmetricLens")
@@ -646,44 +775,77 @@ class FresnelHankelAxisymmetricSciPy:
                 f"Original import error: {_SCIPY_FHT_ERR!r}"
             )
 
+        # Handle backward compatibility for old parameter names
+        if n_gl is not None:
+            if gl_nodes_per_dim is not None:
+                raise ValueError("Cannot specify both n_gl and gl_nodes_per_dim")
+            gl_nodes_per_dim = n_gl
+        if Umax is not None:
+            if min_physical_radius is not None:
+                raise ValueError("Cannot specify both Umax and min_physical_radius")
+            min_physical_radius = Umax
+            # If old Umax is specified, default to no auto-adaptation for backward compat
+            if n_gl is not None:  # Both old params specified
+                auto_R_from_gl_nodes = False
+
+        # Set defaults if still None
+        if gl_nodes_per_dim is None:
+            gl_nodes_per_dim = 128
+        if min_physical_radius is None:
+            min_physical_radius = 1.0
+
         self.lens = lens
-        self.n_gl = int(n_gl)
-        self.Umax = float(Umax)
+        self.gl_nodes_per_dim = int(gl_nodes_per_dim)
+        self.min_physical_radius = float(min_physical_radius)
+        self.auto_R_from_gl_nodes = bool(auto_R_from_gl_nodes)
         self.tol = float(tol)
 
-        # --- Load precomputed 1-D GL nodes ---
-        gl_dir = Path(gl_dir)
-        x_path = gl_dir / f"gl2d_n{n_gl}_U{int(Umax)}.x.npy"
-        w_path = gl_dir / f"gl2d_n{n_gl}_U{int(Umax)}.w.npy"
+        # Store gl_dir for later use
+        if gl_dir is None:
+            gl_dir = os.environ.get("FIONA_GL2D_DIR", "")
+            if not gl_dir:
+                raise RuntimeError(
+                    "gl_dir not provided and FIONA_GL2D_DIR environment variable not set."
+                )
+        self._gl_dir = gl_dir
 
-        if not x_path.exists() or not w_path.exists():
-            raise FileNotFoundError(f"Missing GL files:\n  {x_path}\n  {w_path}")
+        # Don't load nodes yet - will be loaded in __call__ based on frequency range
 
-        x = np.load(x_path)
-        w = np.load(w_path)
+    def _load_and_setup_grid(self, Umax):
+        """
+        Load or compute GL nodes for given Umax and setup FFTLog grid.
+        Uses gauss_legendre_1d from utils, which computes on-the-fly if needed.
+        """
+        # Set FIONA_GL2D_DIR temporarily if needed
+        old_env = os.environ.get("FIONA_GL2D_DIR")
+        try:
+            os.environ["FIONA_GL2D_DIR"] = self._gl_dir
+            
+            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Umax)
+            
+            mask = x > 0
+            rs_gl = x[mask]      # original GL radial nodes u_k
 
-        mask = x > 0
-        rs_gl = x[mask]      # original GL radial nodes u_k
+            # We use the GL nodes to define the radial range and sample count
+            r_min = float(rs_gl.min())
+            r_max = float(rs_gl.max())
+            n_r = rs_gl.size
 
-        # We use the GL nodes to define the radial range and sample count
-        self._r_min = float(rs_gl.min())
-        self._r_max = float(rs_gl.max())
-        self._n_r = rs_gl.size
+            # --- Build logarithmic radial grid, r_j = r_c * exp[(j-j_c)*dln] ---
+            r = np.geomspace(r_min, r_max, n_r)
+            dln = float(np.log(r[1] / r[0]))
+            mu = 0.0
+            bias = 0.0
+            offset = _scipy_fhtoffset(dln, mu=mu, bias=bias)
+            k = np.exp(offset) / r[::-1]
 
-        # --- Build logarithmic radial grid, r_j = r_c * exp[(j-j_c)*dln] ---
-        r = np.geomspace(self._r_min, self._r_max, self._n_r)
-        dln = float(np.log(r[1] / r[0]))
-        mu = 0.0
-        bias = 0.0
-        offset = _scipy_fhtoffset(dln, mu=mu, bias=bias)
-        k = np.exp(offset) / r[::-1]
-
-        self._r = r
-        self._dln = dln
-        self._mu = mu
-        self._bias = bias
-        self._offset = offset
-        self._k = k
+            return r, dln, mu, bias, offset, k
+        finally:
+            # Restore old environment variable
+            if old_env is None:
+                os.environ.pop("FIONA_GL2D_DIR", None)
+            else:
+                os.environ["FIONA_GL2D_DIR"] = old_env
 
     def __call__(self, w_vec, y_vec):
         """
@@ -711,11 +873,18 @@ class FresnelHankelAxisymmetricSciPy:
         if np.any(y_vec <= 0.0):
             raise ValueError("FresnelHankelAxisymmetricSciPy currently requires y > 0.")
 
-        r = self._r
-        dln = self._dln
-        mu = self._mu
-        offset = self._offset
-        k = self._k
+        # Determine Umax based on frequency range
+        if self.auto_R_from_gl_nodes:
+            w_use = float(np.max(np.abs(w_vec)))
+            if w_use <= 0:
+                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
+            Umax_adapt = np.sqrt(self.gl_nodes_per_dim / (2.0 * w_use))
+            Umax = max(self.min_physical_radius, float(Umax_adapt))
+        else:
+            Umax = self.min_physical_radius
+
+        # Load GL nodes and setup grid for this Umax
+        r, dln, mu, bias, offset, k = self._load_and_setup_grid(Umax)
 
         n_w = len(w_vec)
         n_y = len(y_vec)

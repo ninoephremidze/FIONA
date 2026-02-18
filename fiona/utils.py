@@ -332,6 +332,38 @@ def _compute_and_store_gl2d_polar_uniform_theta(n_r, n_theta, u_max):
 # Public API
 # =============================================================================
 
+def gauss_legendre_1d(n, u_max):
+    """
+    Load or build 1D Gauss–Legendre nodes and weights on [-u_max, u_max].
+    
+    If the files don't exist, they are computed and stored as part of the
+    gauss_legendre_2d infrastructure.
+
+    Returns:
+        x, w : 1D numpy arrays of length n (nodes and weights)
+    """
+    n = int(n)
+    u_max = float(u_max)
+
+    if not _FIONA_GL2D_DIR:
+        raise RuntimeError("FIONA_GL2D_DIR is not set.")
+
+    if not _gl2d_exists(n, u_max):
+        if _FIONA_GL2D_STRICT:
+            raise FileNotFoundError(
+                f"No precomputed GL2D files for (n={n}, Umax={u_max})."
+            )
+        print(f"[FIONA] computing GL2D (n={n}, Umax={u_max})...")
+        _compute_and_store_gl2d(n, u_max)
+
+    p = _gl2d_paths(n, u_max)
+
+    x = np.load(p["x"])
+    w = np.load(p["w"])
+
+    return x, w
+
+
 def gauss_legendre_2d(n, u_max):
     """
     Load or build 2D Gauss–Legendre nodes and weights on [-u_max, u_max]^2.
