@@ -164,6 +164,8 @@ class FresnelNUFHT:
         # Determine Umax based on frequency range
         if self.auto_R_from_gl_nodes:
             w_use = float(np.max(np.abs(w_vec)))
+            if w_use <= 0:
+                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
             Umax_adapt = np.sqrt(self.gl_nodes_per_dim / (2.0 * w_use))
             Umax = max(self.min_physical_radius, float(Umax_adapt))
         else:
@@ -504,6 +506,8 @@ class FresnelHankelAxisymmetricTrapezoidal:
         # Determine Umax based on frequency range
         if self.auto_R_from_gl_nodes:
             w_use = float(np.max(np.abs(w_vec)))
+            if w_use <= 0:
+                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
             # Use n_r as the node count for the adaptation formula
             Umax_adapt = np.sqrt(self.n_r / (2.0 * w_use))
             Umax = max(self.min_physical_radius, float(Umax_adapt))
@@ -872,6 +876,8 @@ class FresnelHankelAxisymmetricSciPy:
         # Determine Umax based on frequency range
         if self.auto_R_from_gl_nodes:
             w_use = float(np.max(np.abs(w_vec)))
+            if w_use <= 0:
+                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
             Umax_adapt = np.sqrt(self.gl_nodes_per_dim / (2.0 * w_use))
             Umax = max(self.min_physical_radius, float(Umax_adapt))
         else:
