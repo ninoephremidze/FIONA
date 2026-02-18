@@ -71,11 +71,14 @@ class FresnelNUFHT:
 
     def __init__(self,
                  lens: AxisymmetricLens,
-                 gl_nodes_per_dim: int = 128,
-                 min_physical_radius: float = 1.0,
+                 gl_nodes_per_dim: int = None,
+                 min_physical_radius: float = None,
                  auto_R_from_gl_nodes: bool = True,
                  gl_dir: str = None,
-                 tol: float = 1e-12):
+                 tol: float = 1e-12,
+                 # Deprecated parameters for backward compatibility
+                 n_gl: int = None,
+                 Umax: float = None):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelHankelAxisymmetric requires AxisymmetricLens")
@@ -83,6 +86,25 @@ class FresnelNUFHT:
         if not _HAS_FHT:
             raise ImportError("NUFHT C extension (_pynufht) cannot be loaded: "
                               f"{_FHT_ERR!r}")
+
+        # Handle backward compatibility for old parameter names
+        if n_gl is not None:
+            if gl_nodes_per_dim is not None:
+                raise ValueError("Cannot specify both n_gl and gl_nodes_per_dim")
+            gl_nodes_per_dim = n_gl
+        if Umax is not None:
+            if min_physical_radius is not None:
+                raise ValueError("Cannot specify both Umax and min_physical_radius")
+            min_physical_radius = Umax
+            # If old Umax is specified, default to no auto-adaptation for backward compat
+            if n_gl is not None:  # Both old params specified
+                auto_R_from_gl_nodes = False
+
+        # Set defaults if still None
+        if gl_nodes_per_dim is None:
+            gl_nodes_per_dim = 128
+        if min_physical_radius is None:
+            min_physical_radius = 1.0
 
         self.lens = lens
         self.gl_nodes_per_dim = int(gl_nodes_per_dim)
@@ -405,9 +427,11 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
     def __init__(self, lens: AxisymmetricLens,
                  n_r: int = 1024,
-                 min_physical_radius: float = 50.0,
+                 min_physical_radius: float = None,
                  auto_R_from_gl_nodes: bool = False,
-                 tol: float = 1e-12):
+                 tol: float = 1e-12,
+                 # Deprecated parameter for backward compatibility
+                 Umax: float = None):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError(
@@ -419,6 +443,18 @@ class FresnelHankelAxisymmetricTrapezoidal:
                 "NUFHT C extension (_pynufht) is not available.\n"
                 f"Original import error: {_FHT_ERR!r}"
             )
+
+        # Handle backward compatibility for old parameter name
+        if Umax is not None:
+            if min_physical_radius is not None:
+                raise ValueError("Cannot specify both Umax and min_physical_radius")
+            min_physical_radius = Umax
+            # If old Umax is specified, default to no auto-adaptation for backward compat
+            auto_R_from_gl_nodes = False
+
+        # Set default if still None
+        if min_physical_radius is None:
+            min_physical_radius = 50.0
 
         self.lens = lens
         self.n_r = int(n_r)
@@ -717,11 +753,14 @@ class FresnelHankelAxisymmetricSciPy:
 
     def __init__(self,
                  lens: AxisymmetricLens,
-                 gl_nodes_per_dim: int = 128,
-                 min_physical_radius: float = 1.0,
+                 gl_nodes_per_dim: int = None,
+                 min_physical_radius: float = None,
                  auto_R_from_gl_nodes: bool = True,
                  gl_dir: str = None,
-                 tol: float = 1e-12):
+                 tol: float = 1e-12,
+                 # Deprecated parameters for backward compatibility
+                 n_gl: int = None,
+                 Umax: float = None):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelHankelAxisymmetricSciPy requires AxisymmetricLens")
@@ -731,6 +770,25 @@ class FresnelHankelAxisymmetricSciPy:
                 "scipy.fft.fht (fast Hankel transform) is not available.\n"
                 f"Original import error: {_SCIPY_FHT_ERR!r}"
             )
+
+        # Handle backward compatibility for old parameter names
+        if n_gl is not None:
+            if gl_nodes_per_dim is not None:
+                raise ValueError("Cannot specify both n_gl and gl_nodes_per_dim")
+            gl_nodes_per_dim = n_gl
+        if Umax is not None:
+            if min_physical_radius is not None:
+                raise ValueError("Cannot specify both Umax and min_physical_radius")
+            min_physical_radius = Umax
+            # If old Umax is specified, default to no auto-adaptation for backward compat
+            if n_gl is not None:  # Both old params specified
+                auto_R_from_gl_nodes = False
+
+        # Set defaults if still None
+        if gl_nodes_per_dim is None:
+            gl_nodes_per_dim = 128
+        if min_physical_radius is None:
+            min_physical_radius = 1.0
 
         self.lens = lens
         self.gl_nodes_per_dim = int(gl_nodes_per_dim)
