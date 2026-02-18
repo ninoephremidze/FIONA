@@ -23,31 +23,7 @@ _HAS_FHT = False
 _FHT_ERR = None
 
 try:
-    from juliacall import Main as jl
-
-    jl.seval("""
-        using FastHankelTransform
-        Base.eval(FastHankelTransform, :(using ForwardDiff))
-        import FastHankelTransform: nufht
-
-        function fht_batch(nu, rs, ys, c_re_batch, c_im_batch; tol=1e-12)
-            n_w = size(c_re_batch, 1)
-            n_y = length(ys)
-            g_re_all = Matrix{Float64}(undef, n_w, n_y)
-            g_im_all = Matrix{Float64}(undef, n_w, n_y)
-            for i in 1:n_w
-                cre = @view c_re_batch[i, :]
-                cim = @view c_im_batch[i, :]
-                gre = nufht(nu, rs, cre, ys; tol=tol)
-                gim = nufht(nu, rs, cim, ys; tol=tol)
-                @inbounds g_re_all[i, :] .= gre
-                @inbounds g_im_all[i, :] .= gim
-            end
-            return g_re_all, g_im_all
-        end
-    """)
-
-    j_fht_batch = jl.fht_batch
+    from _pynufht import nufht as _c_nufht
     _HAS_FHT = True
 
 except Exception as e:
@@ -89,7 +65,7 @@ class FresnelNUFHT:
             raise TypeError("FresnelHankelAxisymmetric requires AxisymmetricLens")
 
         if not _HAS_FHT:
-            raise ImportError("FastHankelTransform.jl cannot be loaded: "
+            raise ImportError("NUFHT C extension (_pynufht) cannot be loaded: "
                               f"{_FHT_ERR!r}")
 
         self.lens = lens
@@ -117,9 +93,6 @@ class FresnelNUFHT:
         self._rs = rs.astype(float)
         self._u_weights = u_weights.astype(float)
 
-        # Julia arrays
-        self._jr = jl.Array(self._rs)
-
     # ------------------------------------------------------------------
     # Main evaluation
     # ------------------------------------------------------------------
@@ -135,17 +108,14 @@ class FresnelNUFHT:
         rs = self._rs
         u_weights = self._u_weights
 
-        jr = self._jr
-
         nu = 0
         tol = self.tol
 
         n_w = len(w_vec)
         n_y = len(y_vec)
 
-        # ---- Setup / allocations (Python + Julia) ----
+        # ---- Setup / allocations (Python) ----
         setup_start = time.perf_counter()
-        jy = jl.Array(y_vec)  # Python → Julia (y grid)
         F = np.empty((n_w, n_y), dtype=np.complex128)
         quad_phase = 0.5 * y_vec**2
         setup_end = time.perf_counter()
@@ -204,24 +174,22 @@ class FresnelNUFHT:
             coeff_loop_end = time.perf_counter()
             step1_end = coeff_loop_end
 
-            # ---------- Step 2: Python/Julia interface + Julia NUFHT ----------
-            # 2a. Python → Julia
-            py_to_jl_start = time.perf_counter()
-            j_c_re = jl.Array(c_re)
-            j_c_im = jl.Array(c_im)
-            py_to_jl_end = time.perf_counter()
+            # ---------- Step 2: C NUFHT calls ----------
+            # 2a. Allocate output arrays
+            nufht_alloc_start = time.perf_counter()
+            g_re = np.empty((n_w, n_y), dtype=float)
+            g_im = np.empty((n_w, n_y), dtype=float)
+            nufht_alloc_end = time.perf_counter()
 
-            # 2b. Julia NUFHT call (Julia compute + call overhead)
-            julia_call_start = time.perf_counter()
-            g_re_all, g_im_all = j_fht_batch(nu, jr, jy, j_c_re, j_c_im, tol=tol)
-            julia_call_end = time.perf_counter()
-
-            # 2c. Julia → Python
-            jl_to_py_start = time.perf_counter()
-            g_re = np.array(g_re_all)
-            g_im = np.array(g_im_all)
-            jl_to_py_end = time.perf_counter()
-            step2_end = jl_to_py_end
+            # 2b. NUFHT calls (loop over frequencies)
+            nufht_call_start = time.perf_counter()
+            for i in range(n_w):
+                # Call C NUFHT for real part
+                g_re[i, :] = _c_nufht(nu, rs, c_re[i, :], y_vec)
+                # Call C NUFHT for imaginary part
+                g_im[i, :] = _c_nufht(nu, rs, c_im[i, :], y_vec)
+            nufht_call_end = time.perf_counter()
+            step2_end = nufht_call_end
 
             # ---------- Step 3: Assemble full Fresnel integral (Python) ----------
             step3_loop_start = time.perf_counter()
@@ -251,12 +219,11 @@ class FresnelNUFHT:
         coeff_unaccounted = coeff_loop_time - coeff_sub_total
         step1_unaccounted = step1_total - (alloc_time + coeff_loop_time)
 
-        # Step 2: Python/Julia + Julia
+        # Step 2: C NUFHT
         step2_total = step2_end - step1_end
-        py_to_jl_time = py_to_jl_end - py_to_jl_start
-        julia_time = julia_call_end - julia_call_start
-        jl_to_py_time = jl_to_py_end - jl_to_py_start
-        step2_unaccounted = step2_total - (py_to_jl_time + julia_time + jl_to_py_time)
+        nufht_alloc_time = nufht_alloc_end - nufht_alloc_start
+        nufht_time = nufht_call_end - nufht_call_start
+        step2_unaccounted = step2_total - (nufht_alloc_time + nufht_time)
 
         # Step 3: final loop
         step3_total = step3_end - step2_end
@@ -272,7 +239,7 @@ class FresnelNUFHT:
         # ==================================================================
         print()
         print("────────────────────────────────────────────────────────────")
-        print(" FresnelHankelAxisymmetric (GL_precomputed + Julia NUFHT)")
+        print(" FresnelHankelAxisymmetric (GL_precomputed + C NUFHT)")
         print("────────────────────────────────────────────────────────────")
         print(tracker.report("  CPU usage summary"))
         print()
@@ -280,7 +247,7 @@ class FresnelNUFHT:
         # ---- Step 0 ----
         print("  Step 0: Setup / allocations")
         print("  ───────────────────────────")
-        print(f"    0a. jy (Julia) + F, quad_phase   : "
+        print(f"    0a. F, quad_phase                : "
               f"{_pct(step0_time, total_time):6.2f}%  ({step0_time:10.6f} s)")
         print()
 
@@ -313,15 +280,13 @@ class FresnelNUFHT:
         print()
 
         # ---- Step 2 ----
-        print("  Step 2: Julia NUFHT + Python/Julia interface")
-        print("  ───────────────────────────────────────────")
-        print(f"    2a. Python → Julia (c_re/c_im)   : "
-              f"{_pct(py_to_jl_time, step2_total):6.2f}%  ({py_to_jl_time:10.6f} s)")
-        print(f"    2b. Julia NUFHT (j_fht_batch)    : "
-              f"{_pct(julia_time, step2_total):6.2f}%  ({julia_time:10.6f} s)")
-        print(f"    2c. Julia → Python (g_re/g_im)   : "
-              f"{_pct(jl_to_py_time, step2_total):6.2f}%  ({jl_to_py_time:10.6f} s)")
-        print(f"    2d. other (Step 2)               : "
+        print("  Step 2: C NUFHT")
+        print("  ───────────────")
+        print(f"    2a. allocate g_re/g_im           : "
+              f"{_pct(nufht_alloc_time, step2_total):6.2f}%  ({nufht_alloc_time:10.6f} s)")
+        print(f"    2b. NUFHT calls (loop over w)    : "
+              f"{_pct(nufht_time, step2_total):6.2f}%  ({nufht_time:10.6f} s)")
+        print(f"    2c. other (Step 2)               : "
               f"{_pct(step2_unaccounted, step2_total):6.2f}%  ({step2_unaccounted:10.6f} s)")
         print()
         print(f"    Step 2 total                     : "
@@ -347,7 +312,7 @@ class FresnelNUFHT:
               f"{_pct(step0_time, total_time):6.2f}%  ({step0_time:10.6f} s)")
         print(f"  1. Coefficients (Python)           : "
               f"{_pct(step1_total, total_time):6.2f}%  ({step1_total:10.6f} s)")
-        print(f"  2. Julia NUFHT + interface         : "
+        print(f"  2. C NUFHT                         : "
               f"{_pct(step2_total, total_time):6.2f}%  ({step2_total:10.6f} s)")
         print(f"  3. Final per-w loop (Python)       : "
               f"{_pct(step3_total, total_time):6.2f}%  ({step3_total:10.6f} s)")
@@ -369,7 +334,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
                   exp{i w [ u^2 / (2 w^2) - ψ(u / w) ]} J_0(u y),
 
     We discretize the radial u-integral on [0, Umax] and evaluate the Bessel sum 
-    with FastHankelTransform.jl's `nufht` (nonuniform fast Hankel transform). 
+    with C-based NUFHT (nonuniform fast Hankel transform). 
 
         ∫_0^Umax u f_w(u) J_0(u y) du ≈ ∑_k c_k(w) J_0(y r_k),
 
@@ -377,7 +342,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
         c_k(w) = u_k Δu_k * exp{i w [ u_k^2 / (2 w^2) - ψ(u_k / w) ]}.
 
-    nufht(ν, r_k, c_k, y_j; tol) then returns the vector of Hankel sums
+    nufht(ν, r_k, c_k, y_j) then returns the vector of Hankel sums
     g_j ≈ ∑_k c_k J_ν(y_j r_k).  We have to perform a zeroth-order FHT (ν=0).
     """
 
@@ -393,7 +358,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
         if not _HAS_FHT:
             raise ImportError(
-                "FastHankelTransform.jl is not available via juliacall.\n"
+                "NUFHT C extension (_pynufht) is not available.\n"
                 f"Original import error: {_FHT_ERR!r}"
             )
 
@@ -404,9 +369,6 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
         # Build radial grid r_k and weights w_k for ∫_0^{Umax} u f(u) du.
         self._rs, self._u_weights = self._build_radial_grid()
-
-        # Julia arrays we can reuse on each call
-        self._jr = jl.Array(self._rs)
 
     # ------------------------------------------------------------------
     # Radial grid and quadrature weights
@@ -448,9 +410,6 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
         rs = self._rs                # u_k
         u_weights = self._u_weights  # u_k Δu_k
-
-        jr = self._jr                # Julia array for rs
-        jy = jl.Array(y_vec)         # Julia array for y
 
         nu = 0                       # J_0 Hankel transform
         tol = self.tol
@@ -524,27 +483,23 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
             t1 = stack_end
 
-            # ---------------- Step 2: Python/Julia interface + Julia NUFHT ----------------
-            # 2a. Python → Julia
-            py_to_jl_start = time.perf_counter()
-            j_c_re = jl.Array(c_re_batch)
-            j_c_im = jl.Array(c_im_batch)
-            py_to_jl_end = time.perf_counter()
+            # ---------------- Step 2: C NUFHT ----------------
+            # 2a. Allocate output arrays
+            nufht_alloc_start = time.perf_counter()
+            g_re = np.empty((n_w, n_y), dtype=float)
+            g_im = np.empty((n_w, n_y), dtype=float)
+            nufht_alloc_end = time.perf_counter()
 
-            # 2b. Julia NUFHT call (includes Julia compute + call overhead)
-            julia_call_start = time.perf_counter()
-            g_re_all, g_im_all = j_fht_batch(
-                nu, jr, jy, j_c_re, j_c_im, tol=tol
-            )
-            julia_call_end = time.perf_counter()
+            # 2b. NUFHT calls (loop over frequencies)
+            nufht_call_start = time.perf_counter()
+            for i in range(n_w):
+                # Call C NUFHT for real part
+                g_re[i, :] = _c_nufht(nu, rs, c_re_batch[i, :], y_vec)
+                # Call C NUFHT for imaginary part
+                g_im[i, :] = _c_nufht(nu, rs, c_im_batch[i, :], y_vec)
+            nufht_call_end = time.perf_counter()
 
-            # 2c. Julia → Python
-            jl_to_py_start = time.perf_counter()
-            g_re = np.array(g_re_all, dtype=float)  # shape (n_w, n_y)
-            g_im = np.array(g_im_all, dtype=float)
-            jl_to_py_end = time.perf_counter()
-
-            t2 = jl_to_py_end
+            t2 = nufht_call_end
 
             # ---------------- Step 3: Final assembly in Python ----------------
             final_loop_start = time.perf_counter()
@@ -573,10 +528,9 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
         # Step 2 breakdown
         step2_total = t2 - t1
-        py_to_jl_time = py_to_jl_end - py_to_jl_start
-        julia_time = julia_call_end - julia_call_start
-        jl_to_py_time = jl_to_py_end - jl_to_py_start
-        step2_unaccounted = step2_total - (py_to_jl_time + julia_time + jl_to_py_time)
+        nufht_alloc_time = nufht_alloc_end - nufht_alloc_start
+        nufht_time = nufht_call_end - nufht_call_start
+        step2_unaccounted = step2_total - (nufht_alloc_time + nufht_time)
 
         # Step 3 breakdown
         step3_total = t3 - t2
@@ -591,7 +545,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
         # ───────────────────────────────
         print()
         print("────────────────────────────────────────────────────────────")
-        print(" FresnelHankelAxisymmetric (Trapezoidal + Julia NUFHT)")
+        print(" FresnelHankelAxisymmetric (Trapezoidal + C NUFHT)")
         print("────────────────────────────────────────────────────────────")
         print(tracker.report("  CPU usage summary"))
         print()
@@ -625,15 +579,13 @@ class FresnelHankelAxisymmetricTrapezoidal:
         print()
 
         # ---- Step 2 ----
-        print("  Step 2: Julia NUFHT + Python/Julia interface")
-        print("  ─────────────────────────────────────────────")
-        print(f"    2a. Python → Julia (Array)       : "
-              f"{_pct(py_to_jl_time, step2_total):6.2f}%  ({py_to_jl_time:10.6f} s)")
-        print(f"    2b. Julia NUFHT (j_fht_batch)    : "
-              f"{_pct(julia_time, step2_total):6.2f}%  ({julia_time:10.6f} s)")
-        print(f"    2c. Julia → Python (np.array)    : "
-              f"{_pct(jl_to_py_time, step2_total):6.2f}%  ({jl_to_py_time:10.6f} s)")
-        print(f"    2d. other (Step 2)               : "
+        print("  Step 2: C NUFHT")
+        print("  ───────────────")
+        print(f"    2a. allocate g_re/g_im           : "
+              f"{_pct(nufht_alloc_time, step2_total):6.2f}%  ({nufht_alloc_time:10.6f} s)")
+        print(f"    2b. NUFHT calls (loop over w)    : "
+              f"{_pct(nufht_time, step2_total):6.2f}%  ({nufht_time:10.6f} s)")
+        print(f"    2c. other (Step 2)               : "
               f"{_pct(step2_unaccounted, step2_total):6.2f}%  ({step2_unaccounted:10.6f} s)")
         print()
         print(f"    Step 2 total                     : "
@@ -657,7 +609,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
         print("────────────────────────────────────────────────────────────")
         print(f"  1. Coefficients (Step 1)           : "
               f"{_pct(step1_total, total_time):6.2f}%  ({step1_total:10.6f} s)")
-        print(f"  2. Julia NUFHT + interface (Step 2): "
+        print(f"  2. C NUFHT (Step 2)                : "
               f"{_pct(step2_total, total_time):6.2f}%  ({step2_total:10.6f} s)")
         print(f"  3. Final per-w loop (Step 3)       : "
               f"{_pct(step3_total, total_time):6.2f}%  ({step3_total:10.6f} s)")
