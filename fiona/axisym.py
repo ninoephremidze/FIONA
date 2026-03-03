@@ -645,7 +645,7 @@ class FresnelNUFHTBatched:
 
             # Determine Umax for this group
             if self.auto_R_from_gl_nodes:
-                w_use = float(np.max(np.abs(w_sub)))
+                w_use = float(np.min(np.abs(w_sub)))
                 Umax_adapt = np.sqrt(n_gl / (2.0 * w_use))
                 Umax = max(self.min_physical_radius, float(Umax_adapt))
             else:
