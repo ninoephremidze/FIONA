@@ -67,14 +67,19 @@ def _nufht_batch_worker(args):
     """
     Top-level worker function (must be module-level for picklability).
 
-    Receives a chunk of frequencies, builds Fortran-contiguous coefficient
-    matrices of shape ``(m, batch)``, then calls ``pn.nufht_batch`` twice
-    (once for the real coefficients, once for the imaginary coefficients).
+    Receives a chunk of frequencies and unit GL nodes, then for each frequency
+    computes the per-frequency integration radius Umax(w) = max(min_physical_radius,
+    sqrt(n_gl / (2*|w|))), rescales the unit nodes, and calls ``pn.nufht``
+    individually (since the node positions differ per frequency).
+
+    When ``n_gl == 0`` (fixed mode), uses ``Umax = min_physical_radius`` for all
+    frequencies without per-frequency adaptation.
 
     Parameters
     ----------
     args : tuple
-        (lens, rs, u_weights, y_vec, w_chunk, nu, tol)
+        (lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl)
+        where ``rs_unit`` and ``w_unit`` are GL nodes/weights on the unit interval.
 
     Returns
     -------
@@ -83,27 +88,34 @@ def _nufht_batch_worker(args):
     import _pynufht as pn
     import numpy as np
 
-    lens, rs, u_weights, y_vec, w_chunk, nu, tol = args
+    lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl = args
 
-    m = rs.size
+    n_y = y_vec.size
     batch = len(w_chunk)
 
-    # Build Fortran-contiguous coefficient matrices (m, batch)
-    cs_re = np.empty((m, batch), dtype=float, order='F')
-    cs_im = np.empty((m, batch), dtype=float, order='F')
+    G_re = np.empty((n_y, batch), dtype=float)
+    G_im = np.empty((n_y, batch), dtype=float)
 
     for j, w in enumerate(w_chunk):
+        # Per-frequency integration radius
+        if n_gl > 0:
+            Umax_w = max(min_physical_radius, np.sqrt(n_gl / (2.0 * abs(w))))
+        else:
+            Umax_w = min_physical_radius
+
+        # Rescale unit nodes to physical radial nodes
+        rs = rs_unit * Umax_w
+        u_weights = rs * (w_unit * Umax_w)
+
         u_over_w = rs / w
         psi_vals = lens.psi_r(u_over_w)
         phase = (rs * rs) / (2.0 * w) - w * psi_vals
         fw = np.exp(1j * phase)
         ck = u_weights * fw
-        cs_re[:, j] = ck.real
-        cs_im[:, j] = ck.imag
 
-    # Two batched NUFHT calls; each returns shape (n_y, batch)
-    G_re = pn.nufht_batch(nu, rs, cs_re, y_vec, tol=tol)
-    G_im = pn.nufht_batch(nu, rs, cs_im, y_vec, tol=tol)
+        # Individual NUFHT calls (rs differs per frequency, so batched API cannot be used)
+        G_re[:, j] = pn.nufht(nu, rs, ck.real, y_vec, tol=tol)
+        G_im[:, j] = pn.nufht(nu, rs, ck.imag, y_vec, tol=tol)
 
     return G_re, G_im
 
@@ -226,6 +238,22 @@ class FresnelNUFHT:
             else:
                 os.environ["FIONA_GL2D_DIR"] = old_env
 
+    def _load_gl_nodes_unit(self):
+        """Load or compute GL nodes on the unit interval [-1, 1]."""
+        old_env = os.environ.get("FIONA_GL2D_DIR")
+        try:
+            os.environ["FIONA_GL2D_DIR"] = self._gl_dir
+            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, 1.0)
+            mask = x > 0
+            rs_unit = x[mask].astype(float)
+            w_unit = w[mask].astype(float)
+            return rs_unit, w_unit
+        finally:
+            if old_env is None:
+                os.environ.pop("FIONA_GL2D_DIR", None)
+            else:
+                os.environ["FIONA_GL2D_DIR"] = old_env
+
     # ------------------------------------------------------------------
     # Main evaluation
     # ------------------------------------------------------------------
@@ -238,18 +266,9 @@ class FresnelNUFHT:
         if np.any(w_vec == 0):
             raise ValueError("All w must be nonzero.")
 
-        # Determine Umax based on frequency range
-        if self.auto_R_from_gl_nodes:
-            w_use = float(np.max(np.abs(w_vec)))
-            if w_use <= 0:
-                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
-            Umax_adapt = np.sqrt(self.gl_nodes_per_dim / (2.0 * w_use))
-            Umax = max(self.min_physical_radius, float(Umax_adapt))
-        else:
-            Umax = self.min_physical_radius
-
-        # Load GL nodes for this Umax
-        rs, u_weights = self._load_gl_nodes(Umax)
+        # Load GL nodes on the unit interval once; rescale per frequency below.
+        rs_unit, w_unit = self._load_gl_nodes_unit()
+        n_gl = self.gl_nodes_per_dim
 
         nu = 0
         tol = self.tol
@@ -267,8 +286,9 @@ class FresnelNUFHT:
 
             # ---------- Step 1: Build c_re and c_im batches (Python) ----------
             s1_alloc_start = time.perf_counter()
-            c_re = np.empty((n_w, rs.size), float)
-            c_im = np.empty((n_w, rs.size), float)
+            c_re = np.empty((n_w, rs_unit.size), float)
+            c_im = np.empty((n_w, rs_unit.size), float)
+            rs_per_freq = []   # store per-frequency rs for Step 2
             s1_alloc_end = time.perf_counter()
 
             coeff_loop_start = time.perf_counter()
@@ -280,6 +300,16 @@ class FresnelNUFHT:
             assign_time = 0.0
 
             for i, w in enumerate(w_vec):
+                # Per-frequency integration radius
+                if self.auto_R_from_gl_nodes:
+                    Umax_w = max(self.min_physical_radius,
+                                 np.sqrt(n_gl / (2.0 * abs(w))))
+                else:
+                    Umax_w = self.min_physical_radius
+                rs = rs_unit * Umax_w
+                u_weights = rs * (w_unit * Umax_w)
+                rs_per_freq.append(rs)
+
                 # scale u/w
                 t_a = time.perf_counter()
                 u_over_w = rs / w
@@ -324,13 +354,14 @@ class FresnelNUFHT:
             g_im = np.empty((n_w, n_y), dtype=float)
             nufht_alloc_end = time.perf_counter()
 
-            # 2b. NUFHT calls (loop over frequencies)
+            # 2b. NUFHT calls (loop over frequencies; rs differs per frequency)
             nufht_call_start = time.perf_counter()
             for i in range(n_w):
+                rs_i = rs_per_freq[i]
                 # Call C NUFHT for real part
-                g_re[i, :] = _c_nufht(nu, rs, c_re[i, :], y_vec)
+                g_re[i, :] = _c_nufht(nu, rs_i, c_re[i, :], y_vec)
                 # Call C NUFHT for imaginary part
-                g_im[i, :] = _c_nufht(nu, rs, c_im[i, :], y_vec)
+                g_im[i, :] = _c_nufht(nu, rs_i, c_im[i, :], y_vec)
             nufht_call_end = time.perf_counter()
             step2_end = nufht_call_end
 
@@ -597,6 +628,24 @@ class FresnelNUFHTBatched:
             else:
                 os.environ["FIONA_GL2D_DIR"] = old_env
 
+    def _load_gl_nodes_unit(self, n_gl=None):
+        """Load or compute GL nodes on the unit interval [-1, 1] for given *n_gl*."""
+        if n_gl is None:
+            n_gl = self.gl_nodes_per_dim
+        old_env = os.environ.get("FIONA_GL2D_DIR")
+        try:
+            os.environ["FIONA_GL2D_DIR"] = self._gl_dir
+            x, w = gauss_legendre_1d(n_gl, 1.0)
+            mask = x > 0
+            rs_unit = x[mask].astype(float)
+            w_unit = w[mask].astype(float)
+            return rs_unit, w_unit
+        finally:
+            if old_env is None:
+                os.environ.pop("FIONA_GL2D_DIR", None)
+            else:
+                os.environ["FIONA_GL2D_DIR"] = old_env
+
     # ------------------------------------------------------------------
     # Main evaluation
     # ------------------------------------------------------------------
@@ -643,15 +692,14 @@ class FresnelNUFHTBatched:
         for n_gl, idxs in group_items:
             w_sub = w_vec[idxs]
 
-            # Determine Umax for this group
-            if self.auto_R_from_gl_nodes:
-                w_use = float(np.max(np.abs(w_sub)))
-                Umax_adapt = np.sqrt(n_gl / (2.0 * w_use))
-                Umax = max(self.min_physical_radius, float(Umax_adapt))
-            else:
-                Umax = self.min_physical_radius
+            # Load GL nodes on the unit interval [-1, 1] once per group.
+            # Each worker will rescale them per frequency using
+            # Umax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))).
+            rs_unit, w_unit = self._load_gl_nodes_unit(n_gl)
 
-            rs, u_weights = self._load_gl_nodes(Umax, n_gl=n_gl)
+            # n_gl_for_worker > 0 enables per-frequency Umax adaptation;
+            # 0 signals fixed mode (Umax = min_physical_radius for all w).
+            n_gl_for_worker = n_gl if self.auto_R_from_gl_nodes else 0
 
             # Split this group's frequencies into chunks for parallel workers
             n_sub = len(idxs)
@@ -661,7 +709,8 @@ class FresnelNUFHTBatched:
             chunk_splits = np.array_split(np.arange(n_sub), n_chunks)
 
             worker_args = [
-                (self.lens, rs, u_weights, y_vec, w_sub[ch], nu, self.tol)
+                (self.lens, rs_unit, w_unit, y_vec, w_sub[ch], nu, self.tol,
+                 self.min_physical_radius, n_gl_for_worker)
                 for ch in chunk_splits
                 if len(ch) > 0
             ]
@@ -798,20 +847,8 @@ class FresnelHankelAxisymmetricTrapezoidal:
         if np.any(w_vec == 0.0):
             raise ValueError("All w must be nonzero.")
 
-        # Determine Umax based on frequency range
-        if self.auto_R_from_gl_nodes:
-            w_use = float(np.max(np.abs(w_vec)))
-            if w_use <= 0:
-                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
-            # Use n_r as the node count for the adaptation formula
-            Umax_adapt = np.sqrt(self.n_r / (2.0 * w_use))
-            Umax = max(self.min_physical_radius, float(Umax_adapt))
-        else:
-            Umax = self.min_physical_radius
-
-        # Build radial grid for this Umax
-        rs, u_weights = self._build_radial_grid(Umax)
-
+        # Determine Umax per frequency (computed inside the loop below).
+        # For fixed mode (auto_R_from_gl_nodes=False), Umax = min_physical_radius.
         nu = 0                       # J_0 Hankel transform
         tol = self.tol
 
@@ -832,6 +869,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
             s1_alloc_start = time.perf_counter()
             all_c_re = []
             all_c_im = []
+            rs_per_freq = []
             s1_alloc_end = time.perf_counter()
 
             # 1b. main coefficient loop, with internal breakdown
@@ -843,6 +881,15 @@ class FresnelHankelAxisymmetricTrapezoidal:
             mul_time = 0.0
 
             for w in w_vec:
+                # Per-frequency integration radius
+                if self.auto_R_from_gl_nodes:
+                    Umax_w = max(self.min_physical_radius,
+                                 np.sqrt(self.n_r / (2.0 * abs(w))))
+                else:
+                    Umax_w = self.min_physical_radius
+                rs, u_weights = self._build_radial_grid(Umax_w)
+                rs_per_freq.append(rs)
+
                 # scale u/w
                 t_a = time.perf_counter()
                 u_over_w = rs / w
@@ -876,13 +923,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
             coeff_loop_end = time.perf_counter()
 
-            # 1c. stack into batched arrays
-            stack_start = time.perf_counter()
-            c_re_batch = np.stack(all_c_re, axis=0)
-            c_im_batch = np.stack(all_c_im, axis=0)
-            stack_end = time.perf_counter()
-
-            t1 = stack_end
+            t1 = coeff_loop_end
 
             # ---------------- Step 2: C NUFHT ----------------
             # 2a. Allocate output arrays
@@ -891,13 +932,14 @@ class FresnelHankelAxisymmetricTrapezoidal:
             g_im = np.empty((n_w, n_y), dtype=float)
             nufht_alloc_end = time.perf_counter()
 
-            # 2b. NUFHT calls (loop over frequencies)
+            # 2b. NUFHT calls (loop over frequencies; rs differs per frequency)
             nufht_call_start = time.perf_counter()
             for i in range(n_w):
+                rs_i = rs_per_freq[i]
                 # Call C NUFHT for real part
-                g_re[i, :] = _c_nufht(nu, rs, c_re_batch[i, :], y_vec)
+                g_re[i, :] = _c_nufht(nu, rs_i, all_c_re[i], y_vec)
                 # Call C NUFHT for imaginary part
-                g_im[i, :] = _c_nufht(nu, rs, c_im_batch[i, :], y_vec)
+                g_im[i, :] = _c_nufht(nu, rs_i, all_c_im[i], y_vec)
             nufht_call_end = time.perf_counter()
 
             t2 = nufht_call_end
@@ -921,11 +963,10 @@ class FresnelHankelAxisymmetricTrapezoidal:
         step1_total = t1 - t0
         alloc_lists_time = s1_alloc_end - s1_alloc_start
         coeff_loop_time = coeff_loop_end - coeff_loop_start
-        stack_time = stack_end - stack_start
 
         coeff_sub_total = scale_uw_time + psi_time + phase_time + exp_time + mul_time
         coeff_unaccounted = coeff_loop_time - coeff_sub_total
-        step1_unaccounted = step1_total - (alloc_lists_time + coeff_loop_time + stack_time)
+        step1_unaccounted = step1_total - (alloc_lists_time + coeff_loop_time)
 
         # Step 2 breakdown
         step2_total = t2 - t1
@@ -970,9 +1011,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
               f"{_pct(mul_time, step1_total):6.2f}%  ({mul_time:10.6f} s)")
         print(f"        └─ unaccounted (loop)        : "
               f"{_pct(coeff_unaccounted, step1_total):6.2f}%  ({coeff_unaccounted:10.6f} s)")
-        print(f"    1c. stack to c_re/c_im batch     : "
-              f"{_pct(stack_time, step1_total):6.2f}%  ({stack_time:10.6f} s)")
-        print(f"    1d. other (Step 1)               : "
+        print(f"    1c. other (Step 1)               : "
               f"{_pct(step1_unaccounted, step1_total):6.2f}%  ({step1_unaccounted:10.6f} s)")
         print()
         print(f"    Step 1 total                     : "
@@ -1168,18 +1207,15 @@ class FresnelHankelAxisymmetricSciPy:
         if np.any(y_vec <= 0.0):
             raise ValueError("FresnelHankelAxisymmetricSciPy currently requires y > 0.")
 
-        # Determine Umax based on frequency range
-        if self.auto_R_from_gl_nodes:
-            w_use = float(np.max(np.abs(w_vec)))
-            if w_use <= 0:
-                raise ValueError("All w must be nonzero for auto_R_from_gl_nodes.")
-            Umax_adapt = np.sqrt(self.gl_nodes_per_dim / (2.0 * w_use))
-            Umax = max(self.min_physical_radius, float(Umax_adapt))
-        else:
-            Umax = self.min_physical_radius
+        # Set up the unit grid once; per-frequency r and k are derived by scaling.
+        # dln and offset are scale-invariant and shared across all frequencies.
+        r_unit, dln, mu, bias, offset, k_unit = self._load_and_setup_grid(1.0)
 
-        # Load GL nodes and setup grid for this Umax
-        r, dln, mu, bias, offset, k = self._load_and_setup_grid(Umax)
+        # The sort order of k = k_unit / Umax is independent of Umax (positive scaling),
+        # so pre-compute it and the sorted unit k once.
+        idx = np.argsort(k_unit)
+        k_unit_sorted = k_unit[idx]
+        logk_unit_sorted = np.log(k_unit_sorted)  # log(k_sorted) = log(k_unit_sorted) - log(Umax_w)
 
         n_w = len(w_vec)
         n_y = len(y_vec)
@@ -1193,60 +1229,40 @@ class FresnelHankelAxisymmetricSciPy:
         t0 = time.perf_counter()
 
         with CPUTracker() as tracker:
-            # ---------------- Step 1: Build a_re, a_im ----------------
-            t1a = time.perf_counter()
-            a_re = np.empty((n_w, r.size), dtype=float)
-            a_im = np.empty_like(a_re)
-            t1b = time.perf_counter()
-
+            # ---------------- Per-frequency loop (coeff + FHT + interp) ----------------
             coeff_loop_start = time.perf_counter()
+            logy = np.log(y_vec)
             for i, w in enumerate(w_vec):
+                # Per-frequency integration radius, then scale the unit grid
+                if self.auto_R_from_gl_nodes:
+                    Umax_w = max(self.min_physical_radius,
+                                 np.sqrt(self.gl_nodes_per_dim / (2.0 * abs(w))))
+                else:
+                    Umax_w = self.min_physical_radius
+                r = r_unit * Umax_w
+
                 # phase = r^2/(2w) - w ψ(r/w)
                 phase = (r * r) / (2.0 * w) - w * self.lens.psi_r(r / w)
                 f_w = np.exp(1j * phase)
                 a_r = r * f_w  # a(r) = r f_w(r) for SciPy's integral definition
 
-                a_re[i, :] = a_r.real
-                a_im[i, :] = a_r.imag
-            coeff_loop_end = time.perf_counter()
-            t1 = coeff_loop_end
+                # FHT for this frequency
+                A_re_i = _scipy_fht(a_r.real, dln, mu=mu, offset=offset)
+                A_im_i = _scipy_fht(a_r.imag, dln, mu=mu, offset=offset)
+                A_i = A_re_i + 1j * A_im_i
 
-            # ---------------- Step 2: SciPy fht calls ----------------
-            fht_start = time.perf_counter()
-            A_re = _scipy_fht(a_re, dln, mu=mu, offset=offset)
-            A_im = _scipy_fht(a_im, dln, mu=mu, offset=offset)
-            fht_end = time.perf_counter()
-            t2 = fht_end
+                # k = k_unit / Umax_w; use pre-sorted unit arrays and adjust for scale
+                logk_sorted = logk_unit_sorted - np.log(Umax_w)
+                Ak = A_i[idx]
+                Ak_over_k = Ak * Umax_w / k_unit_sorted  # = Ak / (k_unit_sorted / Umax_w)
 
-            A = A_re + 1j * A_im  # shape (n_w, n_k)
-
-            # ---------------- Step 3: Sorting + interp + final assembly ----------------
-            t3a = time.perf_counter()
-            # Sorting k for monotonic interpolation in log k
-            idx = np.argsort(k)
-            k_sorted = k[idx]
-            logk_sorted = np.log(k_sorted)
-            t3b = time.perf_counter()
-
-            interp_start = time.perf_counter()
-            logy = np.log(y_vec)
-
-            for i, w in enumerate(w_vec):
-                Ak = A[i, idx]
-
-                # Convert from SciPy's "k dr" normalization to the usual "r dr"
-                # Hankel integral by dividing by k.
-                Ak_over_k = Ak / k_sorted
-
-                # Interpolate Ak_over_k(k) onto the requested y (using log-space).
                 real_part = np.interp(logy, logk_sorted, Ak_over_k.real)
                 imag_part = np.interp(logy, logk_sorted, Ak_over_k.imag)
                 g_y = real_part + 1j * imag_part
 
                 F[i, :] = np.exp(1j * w * quad_phase) * g_y / (1j * w)
 
-            interp_end = time.perf_counter()
-            t3 = interp_end
+            coeff_loop_end = time.perf_counter()
 
         t4 = time.perf_counter()
 
@@ -1254,20 +1270,8 @@ class FresnelHankelAxisymmetricSciPy:
         # Timing breakdown
         # ───────────────────────────────
         total_time = t4 - t0
-
-        step1_total = t1 - t0           # allocations + coefficient loop
-        alloc_time = t1b - t1a          # a_re / a_im allocations
-        coeff_loop_time = coeff_loop_end - coeff_loop_start
-
-        step2_total = t2 - t1           # both fht calls
-        fht_time = fht_end - fht_start  # SciPy fht calls (should equal step2_total)
-
-        step3_total = t3 - t2           # sort + logk + interpolation + final assembly
-        sort_time = t3b - t3a
-        interp_time = interp_end - interp_start
-        other_step3 = step3_total - sort_time - interp_time
-
-        unaccounted = total_time - (step1_total + step2_total + step3_total)
+        loop_time = coeff_loop_end - coeff_loop_start
+        unaccounted = total_time - loop_time
 
         # ───────────────────────────────
         # Pretty printing
@@ -1279,48 +1283,17 @@ class FresnelHankelAxisymmetricSciPy:
         print(tracker.report("  CPU usage summary"))
         print()
 
-        print("  Step 1: Coefficient build (Python + NumPy)")
+        print("  Per-frequency loop (coeff + FHT + interp)")
         print("  ───────────────────────────────────────────")
-        print(f"    1a. Alloc a_re/a_im              : "
-              f"{_pct(alloc_time, step1_total):6.2f}%  ({alloc_time:10.6f} s)")
-        print(f"    1b. Coefficient loop (all w)     : "
-              f"{_pct(coeff_loop_time, step1_total):6.2f}%  ({coeff_loop_time:10.6f} s)")
-        print()
-        print(f"    Step 1 total                     : "
-              f"{_pct(step1_total, total_time):6.2f}%  ({step1_total:10.6f} s)")
-        print()
-
-        print("  Step 2: SciPy fast Hankel transform (FFTLog)")
-        print("  ────────────────────────────────────────────")
-        print(f"    2a. fht(a_re) + fht(a_im)        : "
-              f"{_pct(fht_time, total_time):6.2f}%  ({fht_time:10.6f} s)")
-        print()
-        print(f"    Step 2 total                     : "
-              f"{_pct(step2_total, total_time):6.2f}%  ({step2_total:10.6f} s)")
-        print()
-
-        print("  Step 3: Post-processing and interpolation")
-        print("  ──────────────────────────────────────────")
-        print(f"    3a. sort k, logk                 : "
-              f"{_pct(sort_time, step3_total):6.2f}%  ({sort_time:10.6f} s)")
-        print(f"    3b. log-space interp + assembly  : "
-              f"{_pct(interp_time, step3_total):6.2f}%  ({interp_time:10.6f} s)")
-        print(f"    3c. other (step 3)               : "
-              f"{_pct(other_step3, step3_total):6.2f}%  ({other_step3:10.6f} s)")
-        print()
-        print(f"    Step 3 total                     : "
-              f"{_pct(step3_total, total_time):6.2f}%  ({step3_total:10.6f} s)")
+        print(f"    Per-frequency loop (all w)       : "
+              f"{_pct(loop_time, total_time):6.2f}%  ({loop_time:10.6f} s)")
         print()
 
         print("Overall Timing Summary (percent of TOTAL)")
         print("────────────────────────────────────────────────────────────")
-        print(f"  1. Coefficients (Step 1)           : "
-              f"{_pct(step1_total, total_time):6.2f}%  ({step1_total:10.6f} s)")
-        print(f"  2. SciPy FHT (Step 2)              : "
-              f"{_pct(step2_total, total_time):6.2f}%  ({step2_total:10.6f} s)")
-        print(f"  3. Interp + assembly (Step 3)      : "
-              f"{_pct(step3_total, total_time):6.2f}%  ({step3_total:10.6f} s)")
-        print(f"  4. Unaccounted / overhead          : "
+        print(f"  1. Per-frequency loop              : "
+              f"{_pct(loop_time, total_time):6.2f}%  ({loop_time:10.6f} s)")
+        print(f"  2. Unaccounted / overhead          : "
               f"{_pct(unaccounted, total_time):6.2f}%  ({unaccounted:10.6f} s)")
         print("────────────────────────────────────────────────────────────")
         print(f"  TOTAL                              : "
