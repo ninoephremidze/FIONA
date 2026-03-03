@@ -45,6 +45,18 @@ except Exception as e:
 import concurrent.futures
 
 
+def _window_taper_1d(r, R, frac):
+    """Smooth taper for the lens potential near the boundary (1D radial)."""
+    return 0.5 * (1.0 - np.tanh(r - frac * R))
+
+
+def _window_u_taper_1d(r, R, width_frac):
+    """Smooth radial weight taper near r = R (1D radial)."""
+    if width_frac <= 0.0:
+        return 1.0
+    return 0.5 * (1.0 - np.tanh((r - R) / (width_frac * R)))
+
+
 def _adaptive_n_gl(w_abs):
     """
     Choose the number of 1-D Gauss–Legendre nodes for a given |w|.
@@ -78,7 +90,9 @@ def _nufht_batch_worker(args):
     Parameters
     ----------
     args : tuple
-        (lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl)
+        (lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl,
+        window_potential, window_radius_fraction, window_u, window_u_width,
+        use_tail_correction)
         where ``rs_unit`` and ``w_unit`` are GL nodes/weights on the unit interval.
 
     Returns
@@ -88,7 +102,9 @@ def _nufht_batch_worker(args):
     import _pynufht as pn
     import numpy as np
 
-    lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl = args
+    (lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl,
+     window_potential, window_radius_fraction, window_u, window_u_width,
+     use_tail_correction) = args
 
     n_y = y_vec.size
     batch = len(w_chunk)
@@ -107,10 +123,21 @@ def _nufht_batch_worker(args):
         rs = rs_unit * Umax_w
         u_weights = rs * (w_unit * Umax_w)
 
+        if window_u:
+            u_weights = u_weights * _window_u_taper_1d(rs, Umax_w, window_u_width)
+
         u_over_w = rs / w
         psi_vals = lens.psi_r(u_over_w)
-        phase = (rs * rs) / (2.0 * w) - w * psi_vals
-        fw = np.exp(1j * phase)
+        if window_potential:
+            psi_vals = psi_vals * _window_taper_1d(rs, Umax_w, window_radius_fraction)
+
+        if use_tail_correction:
+            phase_base = (rs * rs) / (2.0 * w) - w * psi_vals
+            phase_quad = (rs * rs) / (2.0 * w)
+            fw = np.exp(1j * phase_base) - np.exp(1j * phase_quad)
+        else:
+            phase = (rs * rs) / (2.0 * w) - w * psi_vals
+            fw = np.exp(1j * phase)
         ck = u_weights * fw
 
         # Individual NUFHT calls (rs differs per frequency, so batched API cannot be used)
@@ -165,6 +192,11 @@ class FresnelNUFHT:
                  auto_R_from_gl_nodes: bool = True,
                  gl_dir: str = None,
                  tol: float = 1e-12,
+                 window_potential: bool = True,
+                 window_radius_fraction: float = 0.75,
+                 window_u: bool = True,
+                 window_u_width: float = 0.02,
+                 use_tail_correction: bool = True,
                  # Deprecated parameters for backward compatibility
                  n_gl: int = None,
                  Umax: float = None):
@@ -200,6 +232,11 @@ class FresnelNUFHT:
         self.min_physical_radius = float(min_physical_radius)
         self.auto_R_from_gl_nodes = bool(auto_R_from_gl_nodes)
         self.tol = float(tol)
+        self.window_potential = bool(window_potential)
+        self.window_radius_fraction = float(window_radius_fraction)
+        self.window_u = bool(window_u)
+        self.window_u_width = float(window_u_width)
+        self.use_tail_correction = bool(use_tail_correction)
 
         # Store gl_dir for later use
         if gl_dir is None:
@@ -310,6 +347,9 @@ class FresnelNUFHT:
                 u_weights = rs * (w_unit * Umax_w)
                 rs_per_freq.append(rs)
 
+                if self.window_u:
+                    u_weights = u_weights * _window_u_taper_1d(rs, Umax_w, self.window_u_width)
+
                 # scale u/w
                 t_a = time.perf_counter()
                 u_over_w = rs / w
@@ -317,15 +357,20 @@ class FresnelNUFHT:
 
                 # lens potential ψ(u/w)
                 psi_vals = self.lens.psi_r(u_over_w)
+                if self.window_potential:
+                    psi_vals = psi_vals * _window_taper_1d(rs, Umax_w, self.window_radius_fraction)
                 t_c = time.perf_counter()
 
                 # phase = u^2/(2w) - w ψ(u/w)
-                phase = (rs**2)/(2.0*w) - w*psi_vals
+                if self.use_tail_correction:
+                    phase_base = (rs**2)/(2.0*w) - w*psi_vals
+                    phase_quad = (rs**2)/(2.0*w)
+                    fw = np.exp(1j*phase_base) - np.exp(1j*phase_quad)
+                else:
+                    phase = (rs**2)/(2.0*w) - w*psi_vals
+                    fw = np.exp(1j*phase)
                 t_d = time.perf_counter()
-
-                # exp(i * phase)
-                fw = np.exp(1j*phase)
-                t_e = time.perf_counter()
+                t_e = t_d
 
                 # coefficients c_k(w) = u_k Δu_k f_w(u_k)
                 ck = u_weights * fw
@@ -370,6 +415,8 @@ class FresnelNUFHT:
             for i, w in enumerate(w_vec):
                 g = g_re[i] + 1j*g_im[i]
                 F[i,:] = np.exp(1j*w*quad_phase) * (g/(1j*w))
+                if self.use_tail_correction:
+                    F[i,:] = 1.0 + F[i,:]
             step3_loop_end = time.perf_counter()
             step3_end = step3_loop_end
 
@@ -573,7 +620,12 @@ class FresnelNUFHTBatched:
                  adaptive_n_gl: bool = True,
                  gl_dir: str = None,
                  tol: float = 1e-12,
-                 n_workers: int = None):
+                 n_workers: int = None,
+                 window_potential: bool = True,
+                 window_radius_fraction: float = 0.75,
+                 window_u: bool = True,
+                 window_u_width: float = 0.02,
+                 use_tail_correction: bool = True):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelNUFHTBatched requires AxisymmetricLens")
@@ -599,6 +651,11 @@ class FresnelNUFHTBatched:
         self.adaptive_n_gl = bool(adaptive_n_gl)
         self.tol = float(tol)
         self.n_workers = int(n_workers)
+        self.window_potential = bool(window_potential)
+        self.window_radius_fraction = float(window_radius_fraction)
+        self.window_u = bool(window_u)
+        self.window_u_width = float(window_u_width)
+        self.use_tail_correction = bool(use_tail_correction)
 
         if gl_dir is None:
             gl_dir = os.environ.get("FIONA_GL2D_DIR", "")
@@ -710,7 +767,9 @@ class FresnelNUFHTBatched:
 
             worker_args = [
                 (self.lens, rs_unit, w_unit, y_vec, w_sub[ch], nu, self.tol,
-                 self.min_physical_radius, n_gl_for_worker)
+                 self.min_physical_radius, n_gl_for_worker,
+                 self.window_potential, self.window_radius_fraction,
+                 self.window_u, self.window_u_width, self.use_tail_correction)
                 for ch in chunk_splits
                 if len(ch) > 0
             ]
@@ -732,6 +791,8 @@ class FresnelNUFHTBatched:
                     w = w_vec[i]
                     g = G_re[:, j] + 1j * G_im[:, j]
                     F[i, :] = np.exp(1j * w * quad_phase) * g / (1j * w)
+                    if self.use_tail_correction:
+                        F[i, :] = 1.0 + F[i, :]
 
         return F
 
@@ -776,6 +837,11 @@ class FresnelHankelAxisymmetricTrapezoidal:
                  min_physical_radius: float = None,
                  auto_R_from_gl_nodes: bool = False,
                  tol: float = 1e-12,
+                 window_potential: bool = True,
+                 window_radius_fraction: float = 0.75,
+                 window_u: bool = True,
+                 window_u_width: float = 0.02,
+                 use_tail_correction: bool = True,
                  # Deprecated parameter for backward compatibility
                  Umax: float = None):
 
@@ -807,6 +873,11 @@ class FresnelHankelAxisymmetricTrapezoidal:
         self.min_physical_radius = float(min_physical_radius)
         self.auto_R_from_gl_nodes = bool(auto_R_from_gl_nodes)
         self.tol = float(tol)
+        self.window_potential = bool(window_potential)
+        self.window_radius_fraction = float(window_radius_fraction)
+        self.window_u = bool(window_u)
+        self.window_u_width = float(window_u_width)
+        self.use_tail_correction = bool(use_tail_correction)
 
         # Don't build grid yet - will be built in __call__ based on frequency range
 
@@ -890,6 +961,9 @@ class FresnelHankelAxisymmetricTrapezoidal:
                 rs, u_weights = self._build_radial_grid(Umax_w)
                 rs_per_freq.append(rs)
 
+                if self.window_u:
+                    u_weights = u_weights * _window_u_taper_1d(rs, Umax_w, self.window_u_width)
+
                 # scale u/w
                 t_a = time.perf_counter()
                 u_over_w = rs / w
@@ -897,15 +971,20 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
                 # lens potential ψ(u/w)
                 psi_vals = self.lens.psi_r(u_over_w)
+                if self.window_potential:
+                    psi_vals = psi_vals * _window_taper_1d(rs, Umax_w, self.window_radius_fraction)
                 t_c = time.perf_counter()
 
                 # phase(u) = u^2/(2w) - w ψ(u/w)
-                phase = (rs * rs) / (2.0 * w) - w * psi_vals
+                if self.use_tail_correction:
+                    phase_base = (rs * rs) / (2.0 * w) - w * psi_vals
+                    phase_quad = (rs * rs) / (2.0 * w)
+                    f_w = np.exp(1j * phase_base) - np.exp(1j * phase_quad)
+                else:
+                    phase = (rs * rs) / (2.0 * w) - w * psi_vals
+                    f_w = np.exp(1j * phase)
                 t_d = time.perf_counter()
-
-                # exp(i * phase)
-                f_w = np.exp(1j * phase)
-                t_e = time.perf_counter()
+                t_e = t_d
 
                 # coefficients c_k(w) = u_k Δu_k f_w(u_k)
                 c_k = u_weights * f_w
@@ -949,6 +1028,8 @@ class FresnelHankelAxisymmetricTrapezoidal:
             for i, w in enumerate(w_vec):
                 g = g_re[i, :] + 1j * g_im[i, :]
                 F[i, :] = np.exp(1j * w * quad_phase) * g / (1j * w)
+                if self.use_tail_correction:
+                    F[i, :] = 1.0 + F[i, :]
             final_loop_end = time.perf_counter()
             t3 = final_loop_end
 
@@ -1096,6 +1177,11 @@ class FresnelHankelAxisymmetricSciPy:
                  auto_R_from_gl_nodes: bool = True,
                  gl_dir: str = None,
                  tol: float = 1e-12,
+                 window_potential: bool = True,
+                 window_radius_fraction: float = 0.75,
+                 window_u: bool = True,
+                 window_u_width: float = 0.02,
+                 use_tail_correction: bool = True,
                  # Deprecated parameters for backward compatibility
                  n_gl: int = None,
                  Umax: float = None):
@@ -1133,6 +1219,11 @@ class FresnelHankelAxisymmetricSciPy:
         self.min_physical_radius = float(min_physical_radius)
         self.auto_R_from_gl_nodes = bool(auto_R_from_gl_nodes)
         self.tol = float(tol)
+        self.window_potential = bool(window_potential)
+        self.window_radius_fraction = float(window_radius_fraction)
+        self.window_u = bool(window_u)
+        self.window_u_width = float(window_u_width)
+        self.use_tail_correction = bool(use_tail_correction)
 
         # Store gl_dir for later use
         if gl_dir is None:
@@ -1242,8 +1333,21 @@ class FresnelHankelAxisymmetricSciPy:
                 r = r_unit * Umax_w
 
                 # phase = r^2/(2w) - w ψ(r/w)
-                phase = (r * r) / (2.0 * w) - w * self.lens.psi_r(r / w)
-                f_w = np.exp(1j * phase)
+                psi_vals = self.lens.psi_r(r / w)
+                if self.window_potential:
+                    psi_vals = psi_vals * _window_taper_1d(r, Umax_w, self.window_radius_fraction)
+
+                if self.use_tail_correction:
+                    phase_base = (r * r) / (2.0 * w) - w * psi_vals
+                    phase_quad = (r * r) / (2.0 * w)
+                    f_w = np.exp(1j * phase_base) - np.exp(1j * phase_quad)
+                else:
+                    phase = (r * r) / (2.0 * w) - w * psi_vals
+                    f_w = np.exp(1j * phase)
+
+                if self.window_u:
+                    f_w = f_w * _window_u_taper_1d(r, Umax_w, self.window_u_width)
+
                 a_r = r * f_w  # a(r) = r f_w(r) for SciPy's integral definition
 
                 # FHT for this frequency
@@ -1261,6 +1365,8 @@ class FresnelHankelAxisymmetricSciPy:
                 g_y = real_part + 1j * imag_part
 
                 F[i, :] = np.exp(1j * w * quad_phase) * g_y / (1j * w)
+                if self.use_tail_correction:
+                    F[i, :] = 1.0 + F[i, :]
 
             coeff_loop_end = time.perf_counter()
 
