@@ -80,12 +80,15 @@ def _nufht_batch_worker(args):
     Top-level worker function (must be module-level for picklability).
 
     Receives a chunk of frequencies and unit GL nodes, then for each frequency
-    computes the per-frequency integration radius Umax(w) = max(min_physical_radius,
-    sqrt(n_gl / (2*|w|))), rescales the unit nodes, and calls ``pn.nufht``
-    individually (since the node positions differ per frequency).
+    computes the per-frequency x-domain integration radius
+    Xmax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))), rescales the
+    unit nodes to x-space, and calls ``pn.nufht`` individually (since output
+    points ``|w|*y_vec`` differ per frequency).
 
-    When ``n_gl == 0`` (fixed mode), uses ``Umax = min_physical_radius`` for all
-    frequencies without per-frequency adaptation.
+    When ``n_gl == 0`` (fixed mode), uses ``Xmax = min_physical_radius`` for
+    all frequencies without per-frequency adaptation; in that case the x-nodes
+    are the same for every w and ``integrand_phase = x²/2 − ψ(x)`` is
+    precomputed once.
 
     Parameters
     ----------
@@ -112,37 +115,49 @@ def _nufht_batch_worker(args):
     G_re = np.empty((n_y, batch), dtype=float)
     G_im = np.empty((n_y, batch), dtype=float)
 
-    for j, w in enumerate(w_chunk):
-        # Per-frequency integration radius
-        if n_gl > 0:
-            Umax_w = max(min_physical_radius, np.sqrt(n_gl / (2.0 * abs(w))))
-        else:
-            Umax_w = min_physical_radius
-
-        # Rescale unit nodes to physical radial nodes
-        rs = rs_unit * Umax_w
-        u_weights = rs * (w_unit * Umax_w)
-
+    # Fixed mode: precompute x-nodes and integrand_phase once for all frequencies.
+    if n_gl == 0:
+        Xmax = min_physical_radius
+        xs_fixed = rs_unit * Xmax
+        x_weights_fixed = xs_fixed * (w_unit * Xmax)
         if window_u:
-            u_weights = u_weights * _window_u_taper_1d(rs, Umax_w, window_u_width)
-
-        u_over_w = rs / w
-        psi_vals = lens.psi_r(u_over_w)
+            x_weights_fixed = x_weights_fixed * _window_u_taper_1d(
+                xs_fixed, Xmax, window_u_width)
+        psi_fixed = lens.psi_r(xs_fixed)
         if window_potential:
-            psi_vals = psi_vals * _window_taper_1d(rs, Umax_w, window_radius_fraction)
+            psi_fixed = psi_fixed * _window_taper_1d(
+                xs_fixed, Xmax, window_radius_fraction)
+        integrand_phase_fixed = 0.5 * xs_fixed**2 - psi_fixed
 
-        if use_tail_correction:
-            phase_base = (rs * rs) / (2.0 * w) - w * psi_vals
-            phase_quad = (rs * rs) / (2.0 * w)
-            fw = np.exp(1j * phase_base) - np.exp(1j * phase_quad)
+    for j, w in enumerate(w_chunk):
+        # Per-frequency x-domain integration radius
+        if n_gl > 0:
+            Xmax_w = max(min_physical_radius, np.sqrt(n_gl / (2.0 * abs(w))))
+            xs = rs_unit * Xmax_w
+            x_weights = xs * (w_unit * Xmax_w)
+            if window_u:
+                x_weights = x_weights * _window_u_taper_1d(xs, Xmax_w, window_u_width)
+            psi_vals = lens.psi_r(xs)
+            if window_potential:
+                psi_vals = psi_vals * _window_taper_1d(xs, Xmax_w, window_radius_fraction)
+            integrand_phase = 0.5 * xs**2 - psi_vals
         else:
-            phase = (rs * rs) / (2.0 * w) - w * psi_vals
-            fw = np.exp(1j * phase)
-        ck = u_weights * fw
+            xs = xs_fixed
+            x_weights = x_weights_fixed
+            integrand_phase = integrand_phase_fixed
 
-        # Individual NUFHT calls (rs differs per frequency, so batched API cannot be used)
-        G_re[:, j] = pn.nufht(nu, rs, ck.real, y_vec, tol=tol)
-        G_im[:, j] = pn.nufht(nu, rs, ck.imag, y_vec, tol=tol)
+        # fw = exp(iw * (x²/2 − ψ(x))); subtract free-space term for tail correction
+        if use_tail_correction:
+            fw = (np.exp(1j * w * integrand_phase)
+                  - np.exp(1j * w * 0.5 * xs**2))
+        else:
+            fw = np.exp(1j * w * integrand_phase)
+        ck = x_weights * fw
+
+        # NUFHT output points are |w|·y (x-domain: J₀(w·x·y) = J₀(|w|·x·y))
+        out_pts = abs(w) * y_vec
+        G_re[:, j] = pn.nufht(nu, xs, ck.real, out_pts, tol=tol)
+        G_im[:, j] = pn.nufht(nu, xs, ck.imag, out_pts, tol=tol)
 
     return G_re, G_im
 
@@ -159,14 +174,22 @@ def _pct(part, total):
 class FresnelNUFHT:
     """
     Fresnel integral for axisymmetric lenses using Gauss-Legendre nodes
-    and **FastHankelTransform NUFHT**.
+    and **FastHankelTransform NUFHT** in the **x-domain** formulation.
+
+    The axisymmetric Fresnel integral in x-domain is::
+
+        F(w, y) = (w/i) · e^{iwy²/2} ∫₀^∞ x dx exp{iw[x²/2 − ψ(x)]} J₀(wxy)
+
+    The integrand phase ``x²/2 − ψ(x)`` is independent of ``w``, so in
+    fixed-grid mode (``auto_R_from_gl_nodes=False``) the lens potential
+    ``ψ(x)`` is evaluated only once for all frequencies.
 
     GL nodes are loaded from precomputed files if available, or computed
     on-the-fly and saved to disk (via gauss_legendre_1d from utils.py).
 
     We discard x<0 (symmetry) and use:
-        rs = x[x>0]
-        u_weights = rs * w[x>0]
+        xs = x[x>0]
+        x_weights = xs * w[x>0]
 
     Parameters
     ----------
@@ -175,9 +198,9 @@ class FresnelNUFHT:
     gl_nodes_per_dim : int
         Number of Gauss-Legendre nodes per dimension.
     min_physical_radius : float
-        Minimum physical radius (Umax) to use.
+        Minimum physical radius (Xmax) to use.
     auto_R_from_gl_nodes : bool
-        If True, adapt Umax based on frequency range.
+        If True, adapt Xmax based on frequency range.
         If False, use fixed min_physical_radius.
     gl_dir : str or None
         Directory for GL node files. If None, uses FIONA_GL2D_DIR env var.
@@ -249,9 +272,9 @@ class FresnelNUFHT:
 
         # Don't load nodes yet - will be loaded in __call__ based on frequency range
 
-    def _load_gl_nodes(self, Umax):
+    def _load_gl_nodes(self, Xmax):
         """
-        Load or compute GL nodes for given Umax.
+        Load or compute GL nodes for given Xmax (x-domain integration radius).
         Uses gauss_legendre_1d from utils, which computes on-the-fly if needed.
         """
         # Set FIONA_GL2D_DIR temporarily if needed
@@ -259,15 +282,15 @@ class FresnelNUFHT:
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
             
-            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Umax)
+            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Xmax)
             
-            # Keep only positive u (symmetry of Gauss–Legendre)
+            # Keep only positive x (symmetry of Gauss–Legendre)
             mask = x > 0
-            rs = x[mask]          # u_k
-            du = w[mask]          # Δu_k
-            u_weights = rs * du   # u_k Δu_k for ∫ u f(u) du
+            xs = x[mask]            # x_k
+            dx = w[mask]            # Δx_k
+            x_weights = xs * dx     # x_k Δx_k for ∫ x f(x) dx
 
-            return rs.astype(float), u_weights.astype(float)
+            return xs.astype(float), x_weights.astype(float)
         finally:
             # Restore old environment variable
             if old_env is None:
@@ -317,6 +340,20 @@ class FresnelNUFHT:
         setup_start = time.perf_counter()
         F = np.empty((n_w, n_y), dtype=np.complex128)
         quad_phase = 0.5 * y_vec**2
+
+        # Fixed mode: precompute x-nodes and integrand_phase = x²/2 − ψ(x) once.
+        if not self.auto_R_from_gl_nodes:
+            Xmax_fixed = self.min_physical_radius
+            xs_fixed = rs_unit * Xmax_fixed
+            x_weights_fixed = xs_fixed * (w_unit * Xmax_fixed)
+            if self.window_u:
+                x_weights_fixed = x_weights_fixed * _window_u_taper_1d(
+                    xs_fixed, Xmax_fixed, self.window_u_width)
+            psi_fixed = self.lens.psi_r(xs_fixed)
+            if self.window_potential:
+                psi_fixed = psi_fixed * _window_taper_1d(
+                    xs_fixed, Xmax_fixed, self.window_radius_fraction)
+            integrand_phase_fixed = 0.5 * xs_fixed**2 - psi_fixed
         setup_end = time.perf_counter()
 
         with CPUTracker() as tracker:
@@ -325,69 +362,69 @@ class FresnelNUFHT:
             s1_alloc_start = time.perf_counter()
             c_re = np.empty((n_w, rs_unit.size), float)
             c_im = np.empty((n_w, rs_unit.size), float)
-            rs_per_freq = []   # store per-frequency rs for Step 2
+            xs_per_freq = []   # store per-frequency x-nodes for Step 2
             s1_alloc_end = time.perf_counter()
 
             coeff_loop_start = time.perf_counter()
-            scale_uw_time = 0.0
             psi_time = 0.0
             phase_time = 0.0
-            exp_time = 0.0
             mul_time = 0.0
             assign_time = 0.0
 
             for i, w in enumerate(w_vec):
-                # Per-frequency integration radius
                 if self.auto_R_from_gl_nodes:
-                    Umax_w = max(self.min_physical_radius,
+                    # Adaptive mode: compute x-nodes and integrand_phase per frequency
+                    Xmax_w = max(self.min_physical_radius,
                                  np.sqrt(n_gl / (2.0 * abs(w))))
+                    xs = rs_unit * Xmax_w
+                    x_weights = xs * (w_unit * Xmax_w)
+                    xs_per_freq.append(xs)
+
+                    if self.window_u:
+                        x_weights = x_weights * _window_u_taper_1d(
+                            xs, Xmax_w, self.window_u_width)
+
+                    # lens potential ψ(x) — independent of w
+                    t_a = time.perf_counter()
+                    psi_vals = self.lens.psi_r(xs)
+                    if self.window_potential:
+                        psi_vals = psi_vals * _window_taper_1d(
+                            xs, Xmax_w, self.window_radius_fraction)
+                    t_b = time.perf_counter()
+
+                    # integrand phase: x²/2 − ψ(x)
+                    integrand_phase = 0.5 * xs**2 - psi_vals
+                    t_c = t_b
                 else:
-                    Umax_w = self.min_physical_radius
-                rs = rs_unit * Umax_w
-                u_weights = rs * (w_unit * Umax_w)
-                rs_per_freq.append(rs)
+                    # Fixed mode: reuse precomputed quantities
+                    xs = xs_fixed
+                    x_weights = x_weights_fixed
+                    xs_per_freq.append(xs)
+                    integrand_phase = integrand_phase_fixed
+                    t_a = t_b = t_c = time.perf_counter()
 
-                if self.window_u:
-                    u_weights = u_weights * _window_u_taper_1d(rs, Umax_w, self.window_u_width)
-
-                # scale u/w
-                t_a = time.perf_counter()
-                u_over_w = rs / w
-                t_b = time.perf_counter()
-
-                # lens potential ψ(u/w)
-                psi_vals = self.lens.psi_r(u_over_w)
-                if self.window_potential:
-                    psi_vals = psi_vals * _window_taper_1d(rs, Umax_w, self.window_radius_fraction)
-                t_c = time.perf_counter()
-
-                # phase = u^2/(2w) - w ψ(u/w)
+                # fw = exp(iw · (x²/2 − ψ(x))); subtract free-space for tail correction
                 if self.use_tail_correction:
-                    phase_base = (rs**2)/(2.0*w) - w*psi_vals
-                    phase_quad = (rs**2)/(2.0*w)
-                    fw = np.exp(1j*phase_base) - np.exp(1j*phase_quad)
+                    fw = (np.exp(1j * w * integrand_phase)
+                          - np.exp(1j * w * 0.5 * xs**2))
                 else:
-                    phase = (rs**2)/(2.0*w) - w*psi_vals
-                    fw = np.exp(1j*phase)
+                    fw = np.exp(1j * w * integrand_phase)
                 t_d = time.perf_counter()
-                t_e = t_d
 
-                # coefficients c_k(w) = u_k Δu_k f_w(u_k)
-                ck = u_weights * fw
-                t_f = time.perf_counter()
+                # coefficients c_k(w) = x_k Δx_k f_w(x_k)
+                ck = x_weights * fw
+                t_e = time.perf_counter()
 
                 # write into batches
                 c_re[i,:] = ck.real
                 c_im[i,:] = ck.imag
-                t_g = time.perf_counter()
+                t_f = time.perf_counter()
 
                 # accumulate sub-timings
-                scale_uw_time += (t_b - t_a)
-                psi_time      += (t_c - t_b)
-                phase_time    += (t_d - t_c)
-                exp_time      += (t_e - t_d)
-                mul_time      += (t_f - t_e)
-                assign_time   += (t_g - t_f)
+                psi_time    += (t_b - t_a)
+                phase_time  += (t_d - t_c)
+                mul_time    += (t_e - t_d)
+                assign_time += (t_f - t_e)
 
             coeff_loop_end = time.perf_counter()
             step1_end = coeff_loop_end
@@ -399,22 +436,24 @@ class FresnelNUFHT:
             g_im = np.empty((n_w, n_y), dtype=float)
             nufht_alloc_end = time.perf_counter()
 
-            # 2b. NUFHT calls (loop over frequencies; rs differs per frequency)
+            # 2b. NUFHT calls at output points |w|·y (x-domain scaling)
             nufht_call_start = time.perf_counter()
             for i in range(n_w):
-                rs_i = rs_per_freq[i]
+                xs_i = xs_per_freq[i]
+                out_pts = abs(w_vec[i]) * y_vec
                 # Call C NUFHT for real part
-                g_re[i, :] = _c_nufht(nu, rs_i, c_re[i, :], y_vec)
+                g_re[i, :] = _c_nufht(nu, xs_i, c_re[i, :], out_pts)
                 # Call C NUFHT for imaginary part
-                g_im[i, :] = _c_nufht(nu, rs_i, c_im[i, :], y_vec)
+                g_im[i, :] = _c_nufht(nu, xs_i, c_im[i, :], out_pts)
             nufht_call_end = time.perf_counter()
             step2_end = nufht_call_end
 
             # ---------- Step 3: Assemble full Fresnel integral (Python) ----------
+            # F = e^{iwy²/2} · (w/i) · g   [x-domain prefactor]
             step3_loop_start = time.perf_counter()
             for i, w in enumerate(w_vec):
                 g = g_re[i] + 1j*g_im[i]
-                F[i,:] = np.exp(1j*w*quad_phase) * (g/(1j*w))
+                F[i,:] = np.exp(1j*w*quad_phase) * (w / 1j) * g
                 if self.use_tail_correction:
                     F[i,:] = 1.0 + F[i,:]
             step3_loop_end = time.perf_counter()
@@ -435,8 +474,7 @@ class FresnelNUFHT:
         alloc_time = s1_alloc_end - s1_alloc_start
         coeff_loop_time = coeff_loop_end - coeff_loop_start
 
-        coeff_sub_total = (scale_uw_time + psi_time + phase_time +
-                           exp_time + mul_time + assign_time)
+        coeff_sub_total = (psi_time + phase_time + mul_time + assign_time)
         coeff_unaccounted = coeff_loop_time - coeff_sub_total
         step1_unaccounted = step1_total - (alloc_time + coeff_loop_time)
 
@@ -460,7 +498,7 @@ class FresnelNUFHT:
         # ==================================================================
         print()
         print("────────────────────────────────────────────────────────────")
-        print(" FresnelHankelAxisymmetric (GL_precomputed + C NUFHT)")
+        print(" FresnelHankelAxisymmetric (GL_precomputed + C NUFHT, x-domain)")
         print("────────────────────────────────────────────────────────────")
         print(tracker.report("  CPU usage summary"))
         print()
@@ -468,7 +506,7 @@ class FresnelNUFHT:
         # ---- Step 0 ----
         print("  Step 0: Setup / allocations")
         print("  ───────────────────────────")
-        print(f"    0a. F, quad_phase                : "
+        print(f"    0a. F, quad_phase (+ fixed precomp): "
               f"{_pct(step0_time, total_time):6.2f}%  ({step0_time:10.6f} s)")
         print()
 
@@ -479,15 +517,11 @@ class FresnelNUFHT:
               f"{_pct(alloc_time, step1_total):6.2f}%  ({alloc_time:10.6f} s)")
         print(f"    1b. coefficient loop (total)     : "
               f"{_pct(coeff_loop_time, step1_total):6.2f}%  ({coeff_loop_time:10.6f} s)")
-        print(f"        ├─ scale u/w (all w)         : "
-              f"{_pct(scale_uw_time, step1_total):6.2f}%  ({scale_uw_time:10.6f} s)")
-        print(f"        ├─ lens potential ψ(u/w)     : "
+        print(f"        ├─ lens potential ψ(x)       : "
               f"{_pct(psi_time, step1_total):6.2f}%  ({psi_time:10.6f} s)")
-        print(f"        ├─ phase calculation         : "
+        print(f"        ├─ exp(iw·phase)             : "
               f"{_pct(phase_time, step1_total):6.2f}%  ({phase_time:10.6f} s)")
-        print(f"        ├─ exp(i·phase)              : "
-              f"{_pct(exp_time, step1_total):6.2f}%  ({exp_time:10.6f} s)")
-        print(f"        ├─ multiply by u_k Δu_k      : "
+        print(f"        ├─ multiply by x_k Δx_k      : "
               f"{_pct(mul_time, step1_total):6.2f}%  ({mul_time:10.6f} s)")
         print(f"        ├─ assign into c_re/c_im     : "
               f"{_pct(assign_time, step1_total):6.2f}%  ({assign_time:10.6f} s)")
@@ -517,7 +551,7 @@ class FresnelNUFHT:
         # ---- Step 3 ----
         print("  Step 3: Final per-w loop (Python)")
         print("  ─────────────────────────────────")
-        print(f"    3a. apply quad_phase & 1/(i w)   : "
+        print(f"    3a. apply quad_phase & (w/i)     : "
               f"{_pct(final_loop_time, step3_total):6.2f}%  ({final_loop_time:10.6f} s)")
         print(f"    3b. other (Step 3)               : "
               f"{_pct(step3_unaccounted, step3_total):6.2f}%  ({step3_unaccounted:10.6f} s)")
@@ -666,19 +700,19 @@ class FresnelNUFHTBatched:
                 )
         self._gl_dir = gl_dir
 
-    def _load_gl_nodes(self, Umax, n_gl=None):
-        """Load or compute GL nodes for given *Umax* and *n_gl*."""
+    def _load_gl_nodes(self, Xmax, n_gl=None):
+        """Load or compute GL nodes for given *Xmax* (x-domain radius) and *n_gl*."""
         if n_gl is None:
             n_gl = self.gl_nodes_per_dim
         old_env = os.environ.get("FIONA_GL2D_DIR")
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
-            x, w = gauss_legendre_1d(n_gl, Umax)
+            x, w = gauss_legendre_1d(n_gl, Xmax)
             mask = x > 0
-            rs = x[mask].astype(float)
-            du = w[mask].astype(float)
-            u_weights = rs * du
-            return rs, u_weights
+            xs = x[mask].astype(float)
+            dx = w[mask].astype(float)
+            x_weights = xs * dx
+            return xs, x_weights
         finally:
             if old_env is None:
                 os.environ.pop("FIONA_GL2D_DIR", None)
@@ -790,7 +824,7 @@ class FresnelNUFHTBatched:
                     i = idxs[sub_j]
                     w = w_vec[i]
                     g = G_re[:, j] + 1j * G_im[:, j]
-                    F[i, :] = np.exp(1j * w * quad_phase) * g / (1j * w)
+                    F[i, :] = np.exp(1j * w * quad_phase) * (w / 1j) * g
                     if self.use_tail_correction:
                         F[i, :] = 1.0 + F[i, :]
 
@@ -799,22 +833,23 @@ class FresnelNUFHTBatched:
 
 class FresnelHankelAxisymmetricTrapezoidal:
     r"""
-    Fresnel integral for axisymmetric lenses using a fast Hankel transform.
+    Fresnel integral for axisymmetric lenses using a fast Hankel transform
+    in the **x-domain** formulation.
 
-        F(w, y) = e^{i w y^2 / 2} / (i w) ∫_0^∞ u du
-                  exp{i w [ u^2 / (2 w^2) - ψ(u / w) ]} J_0(u y),
+        F(w, y) = (w/i) · e^{iwy²/2} ∫_0^∞ x dx
+                  exp{iw[x²/2 − ψ(x)]} J_0(wxy),
 
-    We discretize the radial u-integral on [0, Umax] and evaluate the Bessel sum 
-    with C-based NUFHT (nonuniform fast Hankel transform). 
+    We discretize the radial x-integral on [0, Xmax] and evaluate the Bessel sum
+    with C-based NUFHT (nonuniform fast Hankel transform).
 
-        ∫_0^Umax u f_w(u) J_0(u y) du ≈ ∑_k c_k(w) J_0(y r_k),
+        ∫_0^Xmax x f_w(x) J_0(wxy) dx ≈ ∑_k c_k(w) J_0(|w|y r_k),
 
-    where r_k are radial nodes, and
+    where r_k are radial x-nodes, and
 
-        c_k(w) = u_k Δu_k * exp{i w [ u_k^2 / (2 w^2) - ψ(u_k / w) ]}.
+        c_k(w) = x_k Δx_k * exp{iw[x_k²/2 − ψ(x_k)]}.
 
-    nufht(ν, r_k, c_k, y_j) then returns the vector of Hankel sums
-    g_j ≈ ∑_k c_k J_ν(y_j r_k).  We have to perform a zeroth-order FHT (ν=0).
+    nufht(ν, r_k, c_k, |w|·y_j) then returns the vector of Hankel sums
+    g_j ≈ ∑_k c_k J_ν(|w|·y_j · r_k).  We use a zeroth-order FHT (ν=0).
 
     Parameters
     ----------
@@ -823,9 +858,9 @@ class FresnelHankelAxisymmetricTrapezoidal:
     n_r : int
         Number of radial grid points.
     min_physical_radius : float
-        Minimum physical radius (Umax) to use.
+        Minimum physical radius (Xmax) to use.
     auto_R_from_gl_nodes : bool
-        If True, adapt Umax based on frequency range.
+        If True, adapt Xmax based on frequency range.
         If False, use fixed min_physical_radius.
         Note: For this class we use n_r instead of gl_nodes_per_dim in the formula.
     tol : float
@@ -884,29 +919,29 @@ class FresnelHankelAxisymmetricTrapezoidal:
     # ------------------------------------------------------------------
     # Radial grid and quadrature weights
     # ------------------------------------------------------------------
-    def _build_radial_grid(self, Umax):
+    def _build_radial_grid(self, Xmax):
         """
-        Simple uniform radial grid on (0, Umax] with trapezoidal weights.
+        Simple uniform radial grid on (0, Xmax] with trapezoidal weights.
 
         We avoid r=0 to keep things well-behaved numerically; the missing
         interval [0, r_min] is negligible for sufficiently large n_r.
         """
         n = self.n_r
 
-        # n+1 points from 0 to Umax, then drop the first (0).
-        rs_full = np.linspace(0.0, Umax, n + 1, dtype=float)
-        rs = rs_full[1:]               # shape (n,)
-        dr = rs_full[1] - rs_full[0]
+        # n+1 points from 0 to Xmax, then drop the first (0).
+        xs_full = np.linspace(0.0, Xmax, n + 1, dtype=float)
+        xs = xs_full[1:]               # shape (n,)
+        dx = xs_full[1] - xs_full[0]
 
-        # Trapezoidal weights for ∫_0^{Umax} … du.
-        w = np.ones_like(rs) * dr
+        # Trapezoidal weights for ∫_0^{Xmax} … dx.
+        w = np.ones_like(xs) * dx
         w[0] *= 0.5
         w[-1] *= 0.5
 
-        # For ∫ u f(u) du, combine with the extra factor u:
-        u_weights = rs * w            # u_k Δu_k
+        # For ∫ x f(x) dx, combine with the extra factor x:
+        x_weights = xs * w            # x_k Δx_k
 
-        return rs, u_weights
+        return xs, x_weights
 
     def __call__(self, w_vec, y_vec):
         """
@@ -918,8 +953,8 @@ class FresnelHankelAxisymmetricTrapezoidal:
         if np.any(w_vec == 0.0):
             raise ValueError("All w must be nonzero.")
 
-        # Determine Umax per frequency (computed inside the loop below).
-        # For fixed mode (auto_R_from_gl_nodes=False), Umax = min_physical_radius.
+        # Determine Xmax per frequency (computed inside the loop below).
+        # For fixed mode (auto_R_from_gl_nodes=False), Xmax = min_physical_radius.
         nu = 0                       # J_0 Hankel transform
         tol = self.tol
 
@@ -940,65 +975,56 @@ class FresnelHankelAxisymmetricTrapezoidal:
             s1_alloc_start = time.perf_counter()
             all_c_re = []
             all_c_im = []
-            rs_per_freq = []
+            xs_per_freq = []
             s1_alloc_end = time.perf_counter()
 
             # 1b. main coefficient loop, with internal breakdown
             coeff_loop_start = time.perf_counter()
-            scale_uw_time = 0.0
             psi_time = 0.0
             phase_time = 0.0
-            exp_time = 0.0
             mul_time = 0.0
 
             for w in w_vec:
-                # Per-frequency integration radius
+                # Per-frequency x-domain integration radius
                 if self.auto_R_from_gl_nodes:
-                    Umax_w = max(self.min_physical_radius,
+                    Xmax_w = max(self.min_physical_radius,
                                  np.sqrt(self.n_r / (2.0 * abs(w))))
                 else:
-                    Umax_w = self.min_physical_radius
-                rs, u_weights = self._build_radial_grid(Umax_w)
-                rs_per_freq.append(rs)
+                    Xmax_w = self.min_physical_radius
+                xs, x_weights = self._build_radial_grid(Xmax_w)
+                xs_per_freq.append(xs)
 
                 if self.window_u:
-                    u_weights = u_weights * _window_u_taper_1d(rs, Umax_w, self.window_u_width)
+                    x_weights = x_weights * _window_u_taper_1d(xs, Xmax_w, self.window_u_width)
 
-                # scale u/w
+                # lens potential ψ(x) — independent of w
                 t_a = time.perf_counter()
-                u_over_w = rs / w
+                psi_vals = self.lens.psi_r(xs)
+                if self.window_potential:
+                    psi_vals = psi_vals * _window_taper_1d(xs, Xmax_w, self.window_radius_fraction)
                 t_b = time.perf_counter()
 
-                # lens potential ψ(u/w)
-                psi_vals = self.lens.psi_r(u_over_w)
-                if self.window_potential:
-                    psi_vals = psi_vals * _window_taper_1d(rs, Umax_w, self.window_radius_fraction)
+                # fw = exp(iw·(x²/2 − ψ(x))); subtract free-space for tail correction
+                if self.use_tail_correction:
+                    integrand_phase = 0.5 * xs**2 - psi_vals
+                    f_w = (np.exp(1j * w * integrand_phase)
+                           - np.exp(1j * w * 0.5 * xs**2))
+                else:
+                    integrand_phase = 0.5 * xs**2 - psi_vals
+                    f_w = np.exp(1j * w * integrand_phase)
                 t_c = time.perf_counter()
 
-                # phase(u) = u^2/(2w) - w ψ(u/w)
-                if self.use_tail_correction:
-                    phase_base = (rs * rs) / (2.0 * w) - w * psi_vals
-                    phase_quad = (rs * rs) / (2.0 * w)
-                    f_w = np.exp(1j * phase_base) - np.exp(1j * phase_quad)
-                else:
-                    phase = (rs * rs) / (2.0 * w) - w * psi_vals
-                    f_w = np.exp(1j * phase)
+                # coefficients c_k(w) = x_k Δx_k f_w(x_k)
+                c_k = x_weights * f_w
                 t_d = time.perf_counter()
-                t_e = t_d
-
-                # coefficients c_k(w) = u_k Δu_k f_w(u_k)
-                c_k = u_weights * f_w
-                t_f = time.perf_counter()
 
                 all_c_re.append(c_k.real.astype(float))
                 all_c_im.append(c_k.imag.astype(float))
 
                 # accumulate sub-timings
-                scale_uw_time += (t_b - t_a)
-                psi_time += (t_c - t_b)
-                phase_time += (t_d - t_c)
-                exp_time += (t_e - t_d)
-                mul_time += (t_f - t_e)
+                psi_time   += (t_b - t_a)
+                phase_time += (t_c - t_b)
+                mul_time   += (t_d - t_c)
 
             coeff_loop_end = time.perf_counter()
 
@@ -1011,23 +1037,25 @@ class FresnelHankelAxisymmetricTrapezoidal:
             g_im = np.empty((n_w, n_y), dtype=float)
             nufht_alloc_end = time.perf_counter()
 
-            # 2b. NUFHT calls (loop over frequencies; rs differs per frequency)
+            # 2b. NUFHT calls at output points |w|·y (x-domain scaling)
             nufht_call_start = time.perf_counter()
             for i in range(n_w):
-                rs_i = rs_per_freq[i]
+                xs_i = xs_per_freq[i]
+                out_pts = abs(w_vec[i]) * y_vec
                 # Call C NUFHT for real part
-                g_re[i, :] = _c_nufht(nu, rs_i, all_c_re[i], y_vec)
+                g_re[i, :] = _c_nufht(nu, xs_i, all_c_re[i], out_pts)
                 # Call C NUFHT for imaginary part
-                g_im[i, :] = _c_nufht(nu, rs_i, all_c_im[i], y_vec)
+                g_im[i, :] = _c_nufht(nu, xs_i, all_c_im[i], out_pts)
             nufht_call_end = time.perf_counter()
 
             t2 = nufht_call_end
 
             # ---------------- Step 3: Final assembly in Python ----------------
+            # F = e^{iwy²/2} · (w/i) · g   [x-domain prefactor]
             final_loop_start = time.perf_counter()
             for i, w in enumerate(w_vec):
                 g = g_re[i, :] + 1j * g_im[i, :]
-                F[i, :] = np.exp(1j * w * quad_phase) * g / (1j * w)
+                F[i, :] = np.exp(1j * w * quad_phase) * (w / 1j) * g
                 if self.use_tail_correction:
                     F[i, :] = 1.0 + F[i, :]
             final_loop_end = time.perf_counter()
@@ -1045,7 +1073,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
         alloc_lists_time = s1_alloc_end - s1_alloc_start
         coeff_loop_time = coeff_loop_end - coeff_loop_start
 
-        coeff_sub_total = scale_uw_time + psi_time + phase_time + exp_time + mul_time
+        coeff_sub_total = psi_time + phase_time + mul_time
         coeff_unaccounted = coeff_loop_time - coeff_sub_total
         step1_unaccounted = step1_total - (alloc_lists_time + coeff_loop_time)
 
@@ -1068,7 +1096,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
         # ───────────────────────────────
         print()
         print("────────────────────────────────────────────────────────────")
-        print(" FresnelHankelAxisymmetric (Trapezoidal + C NUFHT)")
+        print(" FresnelHankelAxisymmetric (Trapezoidal + C NUFHT, x-domain)")
         print("────────────────────────────────────────────────────────────")
         print(tracker.report("  CPU usage summary"))
         print()
@@ -1080,15 +1108,11 @@ class FresnelHankelAxisymmetricTrapezoidal:
               f"{_pct(alloc_lists_time, step1_total):6.2f}%  ({alloc_lists_time:10.6f} s)")
         print(f"    1b. coefficient loop (total)     : "
               f"{_pct(coeff_loop_time, step1_total):6.2f}%  ({coeff_loop_time:10.6f} s)")
-        print(f"        ├─ scale u/w (all w)         : "
-              f"{_pct(scale_uw_time, step1_total):6.2f}%  ({scale_uw_time:10.6f} s)")
-        print(f"        ├─ lens potential ψ(u/w)     : "
+        print(f"        ├─ lens potential ψ(x)       : "
               f"{_pct(psi_time, step1_total):6.2f}%  ({psi_time:10.6f} s)")
-        print(f"        ├─ phase calculation         : "
+        print(f"        ├─ exp(iw·phase)             : "
               f"{_pct(phase_time, step1_total):6.2f}%  ({phase_time:10.6f} s)")
-        print(f"        ├─ exp(i·phase)              : "
-              f"{_pct(exp_time, step1_total):6.2f}%  ({exp_time:10.6f} s)")
-        print(f"        ├─ multiply by u_k Δu_k      : "
+        print(f"        ├─ multiply by x_k Δx_k      : "
               f"{_pct(mul_time, step1_total):6.2f}%  ({mul_time:10.6f} s)")
         print(f"        └─ unaccounted (loop)        : "
               f"{_pct(coeff_unaccounted, step1_total):6.2f}%  ({coeff_unaccounted:10.6f} s)")
@@ -1116,7 +1140,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
         # ---- Step 3 ----
         print("  Step 3: Final per-w loop (Python)")
         print("  ──────────────────────────────────")
-        print(f"    3a. apply phase & 1/(i w)        : "
+        print(f"    3a. apply quad_phase & (w/i)     : "
               f"{_pct(final_loop_time, step3_total):6.2f}%  ({final_loop_time:10.6f} s)")
         print(f"    3b. other (Step 3)               : "
               f"{_pct(step3_unaccounted, step3_total):6.2f}%  ({step3_unaccounted:10.6f} s)")
@@ -1249,12 +1273,12 @@ class FresnelHankelAxisymmetricSciPy:
             x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Umax)
             
             mask = x > 0
-            rs_gl = x[mask]      # original GL radial nodes u_k
+            xs_gl = x[mask]      # original GL radial nodes x_k
 
             # We use the GL nodes to define the radial range and sample count
-            r_min = float(rs_gl.min())
-            r_max = float(rs_gl.max())
-            n_r = rs_gl.size
+            r_min = float(xs_gl.min())
+            r_max = float(xs_gl.max())
+            n_r = xs_gl.size
 
             # --- Build logarithmic radial grid, r_j = r_c * exp[(j-j_c)*dln] ---
             r = np.geomspace(r_min, r_max, n_r)
@@ -1276,17 +1300,18 @@ class FresnelHankelAxisymmetricSciPy:
         """
         Evaluate F(w, y) on arrays of frequencies `w_vec` and radii `y_vec`.
 
-        Uses SciPy's fast Hankel transform (FFTLog). For each w, we compute,
+        Uses SciPy's fast Hankel transform (FFTLog) in the x-domain.
+        For each w, we compute the x-domain integral
 
-            g_w(y) = ∫_0^∞ u f_w(u) J_0(u y) du,
+            g_w(y) = ∫_0^∞ x f_w(x) J_0(|w|xy) dx,
 
         by mapping to SciPy's definition
 
             A(k) = ∫_0^∞ a(r) J_0(k r) k dr,
 
-        with a(r) = r f_w(r), so that A(k) ≈ k * g_w(k), hence
+        with a(r) = x f_w(x), so that A(k) ≈ k · g_w(k/|w|), hence
 
-            g_w(k) ≈ A(k)/k,
+            g_w(y) ≈ A(|w|y) / (|w|y),
 
         and then interpolate in log-space onto the requested y values.
         """
@@ -1298,15 +1323,15 @@ class FresnelHankelAxisymmetricSciPy:
         if np.any(y_vec <= 0.0):
             raise ValueError("FresnelHankelAxisymmetricSciPy currently requires y > 0.")
 
-        # Set up the unit grid once; per-frequency r and k are derived by scaling.
+        # Set up the unit grid once; per-frequency xs and k are derived by scaling.
         # dln and offset are scale-invariant and shared across all frequencies.
         r_unit, dln, mu, bias, offset, k_unit = self._load_and_setup_grid(1.0)
 
-        # The sort order of k = k_unit / Umax is independent of Umax (positive scaling),
+        # The sort order of k = k_unit / Xmax is independent of Xmax (positive scaling),
         # so pre-compute it and the sorted unit k once.
         idx = np.argsort(k_unit)
         k_unit_sorted = k_unit[idx]
-        logk_unit_sorted = np.log(k_unit_sorted)  # log(k_sorted) = log(k_unit_sorted) - log(Umax_w)
+        logk_unit_sorted = np.log(k_unit_sorted)
 
         n_w = len(w_vec)
         n_y = len(y_vec)
@@ -1324,47 +1349,52 @@ class FresnelHankelAxisymmetricSciPy:
             coeff_loop_start = time.perf_counter()
             logy = np.log(y_vec)
             for i, w in enumerate(w_vec):
-                # Per-frequency integration radius, then scale the unit grid
+                # Per-frequency x-domain integration radius, then scale the unit grid
                 if self.auto_R_from_gl_nodes:
-                    Umax_w = max(self.min_physical_radius,
+                    Xmax_w = max(self.min_physical_radius,
                                  np.sqrt(self.gl_nodes_per_dim / (2.0 * abs(w))))
                 else:
-                    Umax_w = self.min_physical_radius
-                r = r_unit * Umax_w
+                    Xmax_w = self.min_physical_radius
+                xs = r_unit * Xmax_w
 
-                # phase = r^2/(2w) - w ψ(r/w)
-                psi_vals = self.lens.psi_r(r / w)
+                # lens potential ψ(x) — independent of w
+                psi_vals = self.lens.psi_r(xs)
                 if self.window_potential:
-                    psi_vals = psi_vals * _window_taper_1d(r, Umax_w, self.window_radius_fraction)
+                    psi_vals = psi_vals * _window_taper_1d(xs, Xmax_w, self.window_radius_fraction)
 
+                # fw = exp(iw·(x²/2 − ψ(x))); subtract free-space for tail correction
                 if self.use_tail_correction:
-                    phase_base = (r * r) / (2.0 * w) - w * psi_vals
-                    phase_quad = (r * r) / (2.0 * w)
-                    f_w = np.exp(1j * phase_base) - np.exp(1j * phase_quad)
+                    integrand_phase = 0.5 * xs**2 - psi_vals
+                    f_w = (np.exp(1j * w * integrand_phase)
+                           - np.exp(1j * w * 0.5 * xs**2))
                 else:
-                    phase = (r * r) / (2.0 * w) - w * psi_vals
-                    f_w = np.exp(1j * phase)
+                    integrand_phase = 0.5 * xs**2 - psi_vals
+                    f_w = np.exp(1j * w * integrand_phase)
 
                 if self.window_u:
-                    f_w = f_w * _window_u_taper_1d(r, Umax_w, self.window_u_width)
+                    f_w = f_w * _window_u_taper_1d(xs, Xmax_w, self.window_u_width)
 
-                a_r = r * f_w  # a(r) = r f_w(r) for SciPy's integral definition
+                a_r = xs * f_w  # a(x) = x f_w(x) for SciPy's integral definition
 
-                # FHT for this frequency
+                # FHT for this frequency: A(k) = k · ∫ x f_w(x) J_0(kx) dx
                 A_re_i = _scipy_fht(a_r.real, dln, mu=mu, offset=offset)
                 A_im_i = _scipy_fht(a_r.imag, dln, mu=mu, offset=offset)
                 A_i = A_re_i + 1j * A_im_i
 
-                # k = k_unit / Umax_w; use pre-sorted unit arrays and adjust for scale
-                logk_sorted = logk_unit_sorted - np.log(Umax_w)
+                # k = k_unit / Xmax_w; use pre-sorted unit arrays and adjust for scale.
+                # Interpolation target: k = |w|·y  →  log k = log|w| + log y
+                logk_sorted = logk_unit_sorted - np.log(Xmax_w)
                 Ak = A_i[idx]
-                Ak_over_k = Ak * Umax_w / k_unit_sorted  # = Ak / (k_unit_sorted / Umax_w)
+                Ak_over_k = Ak * Xmax_w / k_unit_sorted  # = Ak / (k_unit_sorted / Xmax_w)
 
-                real_part = np.interp(logy, logk_sorted, Ak_over_k.real)
-                imag_part = np.interp(logy, logk_sorted, Ak_over_k.imag)
+                # g_w(y) = A(|w|y) / (|w|y); interpolate at log(|w|·y)
+                logy_w = logy + np.log(abs(w))
+                real_part = np.interp(logy_w, logk_sorted, Ak_over_k.real)
+                imag_part = np.interp(logy_w, logk_sorted, Ak_over_k.imag)
                 g_y = real_part + 1j * imag_part
 
-                F[i, :] = np.exp(1j * w * quad_phase) * g_y / (1j * w)
+                # F = e^{iwy²/2} · (w/i) · g_w(y)   [x-domain prefactor]
+                F[i, :] = np.exp(1j * w * quad_phase) * (w / 1j) * g_y
                 if self.use_tail_correction:
                     F[i, :] = 1.0 + F[i, :]
 
@@ -1384,7 +1414,7 @@ class FresnelHankelAxisymmetricSciPy:
         # ───────────────────────────────
         print()
         print("────────────────────────────────────────────────────────────")
-        print(" FresnelHankelAxisymmetricSciPy Timing")
+        print(" FresnelHankelAxisymmetricSciPy Timing (x-domain)")
         print("────────────────────────────────────────────────────────────")
         print(tracker.report("  CPU usage summary"))
         print()
