@@ -54,6 +54,15 @@ def _ensure_store_dir():
     return p
 
 
+def _u_max_key(u_max: float) -> str:
+    """Stable key for floating-point cache parameters."""
+    # Use repr for round-trip stability and sha256 to keep paths short.
+    return hashlib.sha256(repr(float(u_max)).encode("utf-8")).hexdigest()[:16]
+
+# -----------------------------------------------------------------------------
+# 2D GL cache helpers (unchanged; WARNING: filenames truncate u_max to int)
+# -----------------------------------------------------------------------------
+
 def _gl2d_base(n, u_max):
     """Return the base file path (no suffix) for a GL2D cache with given n and u_max."""
     store = _ensure_store_dir()
@@ -63,9 +72,7 @@ def _gl2d_base(n, u_max):
 
 
 def _gl2d_paths(n, u_max):
-    """
-    Return a dict mapping component names to their file paths for a GL2D cache.
-
+    """Return a dict mapping component names to their file paths for a GL2D cache."""
     Keys: "base", "x", "w", "u1", "u2", "W", "meta".
     Returns None if the store directory is unavailable.
     """
@@ -90,19 +97,46 @@ def _gl2d_exists(n, u_max):
         return False
     return all(p[k].exists() for k in ("x", "w", "u1", "u2", "W", "meta"))
 
+# -----------------------------------------------------------------------------
+# 1D GL cache helpers (NEW)
+# -----------------------------------------------------------------------------
+def _gl1d_base(n, u_max):
+    """Return the base file path (no suffix) for a GL1D cache with given n and u_max."""
+    store = _ensure_store_dir()
+    if store is None:
+        return None
+    key = _u_max_key(u_max)
+    # Include both the hash and a human-friendly truncated numeric value.
+    u_tag = f"{float(u_max):.6g}".replace("+", "").replace("-", "m")
+    return store / f"gl1d_n{int(n)}_U{u_tag}_h{key}"
+
+def _gl1d_paths(n, u_max):
+    """Return file paths for GL1D cache components."""
+    base = _gl1d_base(n, u_max)
+    if base is None:
+        return None
+    return {
+        "base": base,
+        "x": base.with_suffix(".x.npy"),
+        "w": base.with_suffix(".w.npy"),
+        "meta": base.with_suffix(".meta.json"),
+    }
+
+def _gl1d_exists(n, u_max):
+    """Return True if all required GL1D cache files for (n, u_max) exist on disk."""
+    p = _gl1d_paths(n, u_max)
+    if p is None:
+        return False
+    return all(p[k].exists() for k in ("x", "w", "meta"))
 
 # =============================================================================
 # Hash helper
 # =============================================================================
-
 def _sha256_file(path: pathlib.Path, chunk: int = 1 << 22) -> str:
-    """
-    Compute the SHA-256 hex digest of a file, reading it in chunks.
-
+    """Compute the SHA-256 hex digest of a file, reading it in chunks."""
     Args:
         path:  Path to the file.
         chunk: Read buffer size in bytes (default 4 MiB).
-
     Returns:
         Lowercase hex string of the SHA-256 digest.
     """
@@ -115,15 +149,11 @@ def _sha256_file(path: pathlib.Path, chunk: int = 1 << 22) -> str:
             h.update(b)
     return h.hexdigest()
 
-
 # =============================================================================
 # Parallel memmap worker
 # =============================================================================
-
 def _fill_rows_worker(args):
-    """
-    Fill contiguous row blocks of flattened (n*n) GL arrays.
-    """
+    """Fill contiguous row blocks of flattened (n*n) GL arrays."""
     (i0, i1, n, x_path, w_path, u1_path, u2_path, W_path) = args
 
     x = np.load(x_path, mmap_mode="r")
@@ -143,20 +173,16 @@ def _fill_rows_worker(args):
     u2mm.flush()
     Wmm.flush()
 
-
 # =============================================================================
 # Core GL2D builder (memmap + multiprocessing)
 # =============================================================================
-
 def _compute_and_store_gl2d(
     n: int,
     u_max: float,
     nprocs: int = NUM_WORKERS,
     target_chunks_per_proc: int = TARGET_CHUNKS_PER_PROC,
 ):
-    """
-    Build and persist a 2D Gauss–Legendre quadrature grid on [-u_max, u_max]^2.
-
+    """Build and persist a 2D Gauss–Legendre quadrature grid on [-u_max, u_max]^2."""
     The grid is stored as memory-mapped NumPy arrays alongside a JSON metadata
     file. Computation is parallelised across ``nprocs`` worker processes; each
     worker fills a contiguous block of rows of the flattened (n*n) output arrays.
@@ -247,23 +273,46 @@ def _compute_and_store_gl2d(
     with open(paths["meta"], "w") as f:
         json.dump(meta, f, indent=2)
 
+# =============================================================================
+# Core GL1D builder (NEW)
+# =============================================================================
+def _compute_and_store_gl1d(n: int, u_max: float):
+    """Build and persist a 1D Gauss–Legendre rule on [-u_max, u_max]."""
+    n = int(n)
+    u_max = float(u_max)
+
+    paths = _gl1d_paths(n, u_max)
+    store = _ensure_store_dir()
+    if store is None:
+        raise RuntimeError("FIONA_GL2D_DIR is not set or not writable.")
+
+    t0 = time.perf_counter()
+    xi, wi = leggauss(n)
+    x = u_max * xi
+    w = u_max * wi
+    t1 = time.perf_counter()
+
+    np.save(paths["x"], x)
+    np.save(paths["w"], w)
+
+    meta = {
+        "version": 1,
+        "n": n,
+        "u_max": u_max,
+        "dtype": "float64",
+        "dim": 1,
+        "build_time_sec": t1 - t0,
+        "files": {k: paths[k].name for k in ("x", "w")},
+        "sha256": {k: _sha256_file(paths[k]) for k in ("x", "w")},
+        "created": time.time(),
+    }
+
+    with open(paths["meta"], "w") as f:
+        json.dump(meta, f, indent=2)
+
 
 def _compute_and_store_gl2d_polar(n_r, n_theta, u_max):
-    """
-    Build and persist a 2D Gauss–Legendre quadrature grid in polar coordinates.
-
-    The radial coordinate uses a GL rule mapped to [0, u_max]; the angular
-    coordinate uses a GL rule mapped to [0, 2π].  All arrays are stored as
-    memory-mapped files together with a JSON metadata file.
-
-    Args:
-        n_r:     Number of GL points in the radial direction.
-        n_theta: Number of GL points in the angular direction.
-        u_max:   Maximum radius of the integration domain.
-
-    Raises:
-        RuntimeError: If FIONA_GL2D_DIR is unset or not writable.
-    """
+    """Build and persist a 2D Gauss–Legendre quadrature grid in polar coordinates."""
     n_r = int(n_r)
     n_theta = int(n_theta)
     u_max = float(u_max)
@@ -274,33 +323,23 @@ def _compute_and_store_gl2d_polar(n_r, n_theta, u_max):
 
     base = store / f"gl2dpolar_nr{n_r}_nt{n_theta}_U{int(u_max)}"
 
-    # --------------------------------------------------
-    # 1D Gauss–Legendre rules
-    # --------------------------------------------------
     xi_r, wi_r = leggauss(n_r)
     xi_t, wi_t = leggauss(n_theta)
 
-    # Map domains
     r = 0.5 * u_max * (xi_r + 1.0)      # [0, Umax]
     wr = 0.5 * u_max * wi_r
 
     theta = np.pi * (xi_t + 1.0)        # [0, 2π]
     wt = np.pi * wi_t
 
-    # --------------------------------------------------
-    # Allocate flattened arrays
-    # --------------------------------------------------
     size = n_r * n_theta
     r_mm     = np.memmap(base.with_suffix(".r.npy"),
-                          dtype=np.float64, mode="w+", shape=(size,))
+                          dtype=np.float64, mode="w +", shape=(size,))
     theta_mm = np.memmap(base.with_suffix(".theta.npy"),
-                          dtype=np.float64, mode="w+", shape=(size,))
+                          dtype=np.float64, mode="w +", shape=(size,))
     W_mm     = np.memmap(base.with_suffix(".W.npy"),
-                          dtype=np.float64, mode="w+", shape=(size,))
+                          dtype=np.float64, mode="w +", shape=(size,))
 
-    # --------------------------------------------------
-    # Fill arrays
-    # --------------------------------------------------
     k = 0
     for i in range(n_r):
         ri = r[i]
@@ -315,9 +354,6 @@ def _compute_and_store_gl2d_polar(n_r, n_theta, u_max):
     theta_mm.flush()
     W_mm.flush()
 
-    # --------------------------------------------------
-    # Metadata
-    # --------------------------------------------------
     meta = {
         "version": 1,
         "coord": "polar",
@@ -332,23 +368,7 @@ def _compute_and_store_gl2d_polar(n_r, n_theta, u_max):
 
 
 def _compute_and_store_gl2d_polar_uniform_theta(n_r, n_theta, u_max):
-    """
-    Build and persist a 2D quadrature grid in polar coordinates with a uniform
-    angular sampling.
-
-    The radial direction uses a GL rule mapped to [0, u_max].  The angular
-    direction uses equally spaced points on [0, 2π) with the corresponding
-    trapezoidal weight (2π / n_theta), which is exact for trigonometric
-    polynomials of sufficient degree.
-
-    Args:
-        n_r:     Number of GL points in the radial direction.
-        n_theta: Number of uniform points in the angular direction.
-        u_max:   Maximum radius of the integration domain.
-
-    Raises:
-        RuntimeError: If FIONA_GL2D_DIR is unset or not writable.
-    """
+    """Build and persist a 2D quadrature grid in polar coordinates with a uniform angular sampling."""
     n_r = int(n_r)
     n_theta = int(n_theta)
     u_max = float(u_max)
@@ -359,19 +379,17 @@ def _compute_and_store_gl2d_polar_uniform_theta(n_r, n_theta, u_max):
 
     base = store / f"gl2dpolarU_nr{n_r}_nt{n_theta}_U{int(u_max)}"
 
-    # --- GL in r ---
     xi_r, wi_r = leggauss(n_r)
     r = 0.5 * u_max * (xi_r + 1.0)
     wr = 0.5 * u_max * wi_r
 
-    # --- Uniform theta ---
     theta = 2.0 * np.pi * np.arange(n_theta) / n_theta
     wt = 2.0 * np.pi / n_theta
 
     size = n_r * n_theta
-    r_mm     = np.memmap(base.with_suffix(".r.npy"), dtype=np.float64, mode="w+", shape=(size,))
-    theta_mm = np.memmap(base.with_suffix(".theta.npy"), dtype=np.float64, mode="w+", shape=(size,))
-    W_mm     = np.memmap(base.with_suffix(".W.npy"), dtype=np.float64, mode="w+", shape=(size,))
+    r_mm     = np.memmap(base.with_suffix(".r.npy"), dtype=np.float64, mode="w +", shape=(size,))
+    theta_mm = np.memmap(base.with_suffix(".theta.npy"), dtype=np.float64, mode="w +", shape=(size,))
+    W_mm     = np.memmap(base.with_suffix(".W.npy"), dtype=np.float64, mode="w +", shape=(size,))
 
     k = 0
     for i in range(n_r):
@@ -400,20 +418,11 @@ def _compute_and_store_gl2d_polar_uniform_theta(n_r, n_theta, u_max):
     with open(base.with_suffix(".meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-
 # =============================================================================
 # Public API
 # =============================================================================
-
 def gauss_legendre_2d(n, u_max, label="Umax", verbose=True):
-    """
-    Load or build 2D Gauss–Legendre nodes and weights on [-u_max, u_max]^2.
-
-    label controls the printed extent name (e.g., "Umax" or "R").
-
-    Returns:
-        u1, u2, W : memory-mapped 1D arrays of length n*n
-    """
+    """Load or build 2D Gauss–Legendre nodes and weights on [-u_max, u_max]^2."""
     n = int(n)
     u_max = float(u_max)
 
@@ -437,43 +446,30 @@ def gauss_legendre_2d(n, u_max, label="Umax", verbose=True):
 
     return u1, u2, W
 
-
 def gauss_legendre_1d(n, u_max, label="Umax", verbose=True):
-    """
-    Load or build 1D Gauss–Legendre nodes and weights on [-u_max, u_max].
-
-    Returns:
-        x, w : memory-mapped 1D arrays of length n
-    """
+    """Load or build 1D Gauss–Legendre nodes and weights on [-u_max, u_max]."""
     n = int(n)
     u_max = float(u_max)
 
     if not _FIONA_GL2D_DIR:
         raise RuntimeError("FIONA_GL2D_DIR is not set.")
 
-    if not _gl2d_exists(n, u_max):
+    if not _gl1d_exists(n, u_max):
         if _FIONA_GL2D_STRICT:
             raise FileNotFoundError(
-                f"No precomputed GL2D files for (n={n}, {label}={u_max})."
+                f"No precomputed GL1D files for (n={n}, {label}={u_max})."
             )
         if verbose:
-            print(f"[FIONA] computing GL2D (n={n}, {label}={u_max})...")
-        _compute_and_store_gl2d(n, u_max)
+            print(f"[FIONA] computing GL1D (n={n}, {label}={u_max})...")
+        _compute_and_store_gl1d(n, u_max)
 
-    p = _gl2d_paths(n, u_max)
-    # x and w were written with np.save (npy header), so use np.load
+    p = _gl1d_paths(n, u_max)
     x = np.load(p["x"], mmap_mode="r")
     w = np.load(p["w"], mmap_mode="r")
     return x, w
 
-
 def gauss_legendre_polar_2d(n_r, n_theta, u_max):
-    """
-    Load or build 2D Gauss–Legendre nodes and weights in polar coordinates.
-
-    Returns:
-        r, theta, W : memory-mapped 1D arrays of length n_r * n_theta
-    """
+    """Load or build 2D Gauss–Legendre nodes and weights in polar coordinates."""
     n_r = int(n_r)
     n_theta = int(n_theta)
     u_max = float(u_max)
@@ -509,23 +505,8 @@ def gauss_legendre_polar_2d(n_r, n_theta, u_max):
 
     return r, theta, W
 
-
 def gauss_legendre_polar_uniform_theta_2d(n_r, n_theta, u_max):
-    """
-    Load or build 2D quadrature nodes and weights in polar coordinates with
-    uniform angular sampling.
-
-    The radial direction uses a Gauss–Legendre rule on [0, u_max]; the angular
-    direction uses equally spaced points on [0, 2π) with trapezoidal weights.
-
-    Args:
-        n_r:     Number of GL points in the radial direction.
-        n_theta: Number of uniform points in the angular direction.
-        u_max:   Maximum radius of the integration domain.
-
-    Returns:
-        r, theta, W : memory-mapped 1D arrays of length n_r * n_theta.
-    """
+    """Load or build 2D quadrature nodes and weights in polar coordinates with uniform angular sampling."""
     n_r = int(n_r)
     n_theta = int(n_theta)
     u_max = float(u_max)
@@ -559,36 +540,17 @@ def gauss_legendre_polar_uniform_theta_2d(n_r, n_theta, u_max):
 # =============================================================================
 # Complex interpolation helper (unchanged)
 # =============================================================================
-
 def interp_complex_logx(x, xp, fp):
-    """
-    Interpolate a complex-valued function in log-x space.
-
-    Separately interpolates the real and imaginary parts of fp using
-    numpy.interp on a logarithmic x-axis, then recombines the result.
-
-    Args:
-        x:  Query points (positive real).
-        xp: Known x-coordinates (positive real, monotonically increasing).
-        fp: Known complex function values at xp.
-
-    Returns:
-        Complex interpolated values at x.
-    """
+    """Interpolate a complex-valued function in log-x space."""
     xr = np.interp(np.log(x), np.log(xp), np.real(fp))
     xi = np.interp(np.log(x), np.log(xp), np.imag(fp))
     return xr + 1j * xi
 
-
 # =============================================================================
 # CPU usage tracker
 # =============================================================================
-
 class CPUTracker:
-    """
-    Measure average parallelism over a code block:
-      effective_cores = CPU_seconds / wall_seconds
-    """
+    """Measure average parallelism over a code block."""
 
     def __init__(self, include_children=True):
         self.include_children = include_children
@@ -629,32 +591,18 @@ class CPUTracker:
         self.avg_cpu_percent = 100.0 * self.effective_cores / n
         self.n_logical = n
 
-    def report(self, label="[CPU]"):
+    def report(self, label="[CPU]"): 
         return (
             f"{label} avg {self.effective_cores:.2f} cores over {self.wall:.3f}s "
             f"({self.avg_cpu_percent:.1f}% of {self.n_logical} logical cores; "
             f"CPU sec={self.cpu:.3f})"
         )
 
-
 # =============================================================================
 # Timing helpers
 # =============================================================================
-
 def time_func(fn, *args, repeat=3, warmup=1, **kwargs):
-    """
-    Benchmark a callable and return the best wall-clock time over several runs.
-
-    Args:
-        fn:     The function to time.
-        *args:  Positional arguments forwarded to fn.
-        repeat: Number of timed iterations (default 3).
-        warmup: Number of untimed warm-up calls made before timing (default 1).
-        **kwargs: Keyword arguments forwarded to fn.
-
-    Returns:
-        Best elapsed time in seconds (float).
-    """
+    """Benchmark a callable and return the best wall-clock time."""
     for _ in range(max(0, warmup)):
         fn(*args, **kwargs)
     best = float("inf")
@@ -664,21 +612,8 @@ def time_func(fn, *args, repeat=3, warmup=1, **kwargs):
         best = min(best, time.perf_counter() - t0)
     return best
 
-
 def align_global_phase(a, b):
-    """
-    Remove the global phase offset between two complex arrays.
-
-    Estimates the mean phase difference φ = angle(mean(a / b)) and returns
-    a rotated by -φ so that it is in phase with b.
-
-    Args:
-        a: Complex array to rotate.
-        b: Reference complex array.
-
-    Returns:
-        (a_aligned, phi): phase-corrected copy of a and the applied phase angle φ.
-    """
+    """Remove the global phase offset between two complex arrays."""
     m = np.mean(a / np.maximum(1e-300, b))
     phi = np.angle(m)
     return a * np.exp(-1j * phi), phi
@@ -686,13 +621,11 @@ def align_global_phase(a, b):
 # =============================================================================
 # Plotting settings
 # =============================================================================
-
 try:
     from scipy.interpolate import CubicSpline, UnivariateSpline
     _HAS_SCIPY = True
 except Exception:
     _HAS_SCIPY = False
-
 
 def _make_sorted_unique(x, y):
     """Ensure x is strictly increasing for spline routines."""
@@ -704,17 +637,8 @@ def _make_sorted_unique(x, y):
     mask = np.concatenate(([True], np.diff(x) > 0))
     return x[mask], y[mask]
 
-
 def spline_fit_eval(x, y, x_fine, method="cubic", smooth_s=None):
-    """
-    Fit/evaluate a spline for y(x) on x_fine.
-
-    method:
-      - "cubic": interpolating cubic spline (passes through points)
-      - "smooth": smoothing spline (needs SciPy; uses UnivariateSpline)
-    smooth_s:
-      - only used for method="smooth". Larger => smoother.
-    """
+    """Fit/evaluate a spline for y(x) on x_fine."""
     x, y = _make_sorted_unique(x, y)
     x_fine = np.asarray(x_fine)
 
