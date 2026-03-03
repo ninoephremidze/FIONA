@@ -625,9 +625,9 @@ class FresnelNUFHTBatched:
         Number of Gauss–Legendre nodes per dimension (default 128).
         Ignored when ``adaptive_n_gl=True``.
     min_physical_radius : float, optional
-        Minimum physical radius ``Umax`` to use (default 1.0).
+        Minimum physical radius ``Xmax`` to use (default 1.0).
     auto_R_from_gl_nodes : bool, optional
-        If ``True`` (default), adapt ``Umax`` from the frequency range.
+        If ``True`` (default), adapt ``Xmax`` from the frequency range.
     adaptive_n_gl : bool, optional
         If ``True`` (default), automatically choose the number of GL nodes
         per frequency bin using the same schedule as ``general.py``:
@@ -785,11 +785,11 @@ class FresnelNUFHTBatched:
 
             # Load GL nodes on the unit interval [-1, 1] once per group.
             # Each worker will rescale them per frequency using
-            # Umax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))).
+            # Xmax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))).
             rs_unit, w_unit = self._load_gl_nodes_unit(n_gl)
 
-            # n_gl_for_worker > 0 enables per-frequency Umax adaptation;
-            # 0 signals fixed mode (Umax = min_physical_radius for all w).
+            # n_gl_for_worker > 0 enables per-frequency Xmax adaptation;
+            # 0 signals fixed mode (Xmax = min_physical_radius for all w).
             n_gl_for_worker = n_gl if self.auto_R_from_gl_nodes else 0
 
             # Split this group's frequencies into chunks for parallel workers
@@ -1171,8 +1171,9 @@ class FresnelHankelAxisymmetricTrapezoidal:
 class FresnelHankelAxisymmetricSciPy:
     """
     Fresnel integral for axisymmetric lenses using Gauss-Legendre nodes
-    for configuration (gl_nodes_per_dim, Umax), and performing the Hankel
-    transform with SciPy's FFTLog-based fast Hankel transform (scipy.fft.fht).
+    for configuration (gl_nodes_per_dim, Xmax) in the **x-domain**, and
+    performing the Hankel transform with SciPy's FFTLog-based fast Hankel
+    transform (scipy.fft.fht).
 
     GL nodes are loaded from precomputed files if available, or computed
     on-the-fly and saved to disk (via gauss_legendre_1d from utils.py).
@@ -1184,9 +1185,9 @@ class FresnelHankelAxisymmetricSciPy:
     gl_nodes_per_dim : int
         Number of Gauss-Legendre nodes per dimension.
     min_physical_radius : float
-        Minimum physical radius (Umax) to use.
+        Minimum physical radius (Xmax) to use.
     auto_R_from_gl_nodes : bool
-        If True, adapt Umax based on frequency range.
+        If True, adapt Xmax based on frequency range.
         If False, use fixed min_physical_radius.
     gl_dir : str or None
         Directory for GL node files. If None, uses FIONA_GL2D_DIR env var.
@@ -1260,9 +1261,9 @@ class FresnelHankelAxisymmetricSciPy:
 
         # Don't load nodes yet - will be loaded in __call__ based on frequency range
 
-    def _load_and_setup_grid(self, Umax):
+    def _load_and_setup_grid(self, Xmax):
         """
-        Load or compute GL nodes for given Umax and setup FFTLog grid.
+        Load or compute GL nodes for given Xmax (x-domain radius) and setup FFTLog grid.
         Uses gauss_legendre_1d from utils, which computes on-the-fly if needed.
         """
         # Set FIONA_GL2D_DIR temporarily if needed
@@ -1270,7 +1271,7 @@ class FresnelHankelAxisymmetricSciPy:
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
             
-            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Umax)
+            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Xmax)
             
             mask = x > 0
             xs_gl = x[mask]      # original GL radial nodes x_k
