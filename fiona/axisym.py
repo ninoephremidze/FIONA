@@ -394,7 +394,7 @@ class FresnelNUFHT:
 
                     # integrand phase: x²/2 − ψ(x)
                     integrand_phase = 0.5 * xs**2 - psi_vals
-                    t_c = t_b
+                    t_c = time.perf_counter()
                 else:
                     # Fixed mode: reuse precomputed quantities
                     xs = xs_fixed
@@ -519,7 +519,7 @@ class FresnelNUFHT:
               f"{_pct(coeff_loop_time, step1_total):6.2f}%  ({coeff_loop_time:10.6f} s)")
         print(f"        ├─ lens potential ψ(x)       : "
               f"{_pct(psi_time, step1_total):6.2f}%  ({psi_time:10.6f} s)")
-        print(f"        ├─ exp(iw·phase)             : "
+        print(f"        ├─ integrand phase + exp(iw·φ): "
               f"{_pct(phase_time, step1_total):6.2f}%  ({phase_time:10.6f} s)")
         print(f"        ├─ multiply by x_k Δx_k      : "
               f"{_pct(mul_time, step1_total):6.2f}%  ({mul_time:10.6f} s)")
@@ -1110,7 +1110,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
               f"{_pct(coeff_loop_time, step1_total):6.2f}%  ({coeff_loop_time:10.6f} s)")
         print(f"        ├─ lens potential ψ(x)       : "
               f"{_pct(psi_time, step1_total):6.2f}%  ({psi_time:10.6f} s)")
-        print(f"        ├─ exp(iw·phase)             : "
+        print(f"        ├─ integrand phase + exp(iw·φ): "
               f"{_pct(phase_time, step1_total):6.2f}%  ({phase_time:10.6f} s)")
         print(f"        ├─ multiply by x_k Δx_k      : "
               f"{_pct(mul_time, step1_total):6.2f}%  ({mul_time:10.6f} s)")
