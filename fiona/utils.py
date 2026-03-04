@@ -150,7 +150,7 @@ def _sha256_file(path: pathlib.Path, chunk: int = 1 << 22) -> str:
     return h.hexdigest()
 
 # =============================================================================
-# Parallel memmap worker
+# Parallel memmap workers
 # =============================================================================
 def _fill_rows_worker(args):
     """Fill contiguous row blocks of flattened (n*n) GL arrays."""
@@ -172,6 +172,30 @@ def _fill_rows_worker(args):
     u1mm.flush()
     u2mm.flush()
     Wmm.flush()
+
+
+def _fill_polar_rows_worker(args):
+    """Fill contiguous row blocks of flattened (n_r*n_theta) polar GL arrays.
+
+    Handles both GL-theta and uniform-theta polar grids: ``wt`` may be a
+    1-D NumPy array (GL case) or a scalar (uniform case); NumPy broadcasting
+    takes care of either.
+    """
+    (i0, i1, n_theta, size, r, wr, theta, wt, r_path, theta_path, W_path) = args
+
+    r_mm     = np.memmap(r_path,     dtype=np.float64, mode="r+", shape=(size,))
+    theta_mm = np.memmap(theta_path, dtype=np.float64, mode="r+", shape=(size,))
+    W_mm     = np.memmap(W_path,     dtype=np.float64, mode="r+", shape=(size,))
+
+    for i in range(i0, i1):
+        row = slice(i * n_theta, (i + 1) * n_theta)
+        r_mm[row]     = r[i]
+        theta_mm[row] = theta        # array of length n_theta
+        W_mm[row]     = wr[i] * wt * r[i]  # wt: array or scalar; Jacobian r
+
+    r_mm.flush()
+    theta_mm.flush()
+    W_mm.flush()
 
 # =============================================================================
 # Core GL2D builder (memmap + multiprocessing)
@@ -276,8 +300,16 @@ def _compute_and_store_gl2d(
 # =============================================================================
 # Core GL1D builder (NEW)
 # =============================================================================
-def _compute_and_store_gl1d(n: int, u_max: float):
-    """Build and persist a 1D Gauss–Legendre rule on [-u_max, u_max]."""
+def _compute_and_store_gl1d(n: int, u_max: float, nprocs: int = NUM_WORKERS):
+    """Build and persist a 1D Gauss–Legendre rule on [-u_max, u_max].
+
+    Args:
+        n:      Number of GL quadrature points.
+        u_max:  Half-extent of the integration domain.
+        nprocs: Number of worker processes (recorded in metadata; the 1D
+                computation is inherently serial but the parameter is
+                accepted for API consistency with the 2D builders).
+    """
     n = int(n)
     u_max = float(u_max)
 
@@ -302,8 +334,10 @@ def _compute_and_store_gl1d(n: int, u_max: float):
         "dtype": "float64",
         "dim": 1,
         "build_time_sec": t1 - t0,
+        "cores_used": 1,
         "files": {k: paths[k].name for k in ("x", "w")},
         "sha256": {k: _sha256_file(paths[k]) for k in ("x", "w")},
+        "hostname": os.uname().nodename if hasattr(os, "uname") else None,
         "created": time.time(),
     }
 
@@ -311,8 +345,26 @@ def _compute_and_store_gl1d(n: int, u_max: float):
         json.dump(meta, f, indent=2)
 
 
-def _compute_and_store_gl2d_polar(n_r, n_theta, u_max):
-    """Build and persist a 2D Gauss–Legendre quadrature grid in polar coordinates."""
+def _compute_and_store_gl2d_polar(
+    n_r: int,
+    n_theta: int,
+    u_max: float,
+    nprocs: int = NUM_WORKERS,
+    target_chunks_per_proc: int = TARGET_CHUNKS_PER_PROC,
+):
+    """Build and persist a 2D Gauss–Legendre quadrature grid in polar coordinates.
+
+    The radial rule uses GL nodes mapped to [0, u_max]; the angular rule uses GL
+    nodes mapped to [0, 2π].  The flattened output arrays are filled in parallel
+    by splitting radial rows across ``nprocs`` worker processes.
+
+    Args:
+        n_r:                    Number of GL points in the radial direction.
+        n_theta:                Number of GL points in the angular direction.
+        u_max:                  Outer radius of the integration domain.
+        nprocs:                 Number of worker processes to use.
+        target_chunks_per_proc: Desired number of row-chunks per worker.
+    """
     n_r = int(n_r)
     n_theta = int(n_theta)
     u_max = float(u_max)
@@ -333,42 +385,80 @@ def _compute_and_store_gl2d_polar(n_r, n_theta, u_max):
     wt = np.pi * wi_t
 
     size = n_r * n_theta
-    r_mm     = np.memmap(base.with_suffix(".r.npy"),
-                          dtype=np.float64, mode="w +", shape=(size,))
-    theta_mm = np.memmap(base.with_suffix(".theta.npy"),
-                          dtype=np.float64, mode="w +", shape=(size,))
-    W_mm     = np.memmap(base.with_suffix(".W.npy"),
-                          dtype=np.float64, mode="w +", shape=(size,))
 
-    k = 0
-    for i in range(n_r):
-        ri = r[i]
-        wi = wr[i]
-        for j in range(n_theta):
-            r_mm[k]     = ri
-            theta_mm[k] = theta[j]
-            W_mm[k]     = wi * wt[j] * ri   # Jacobian r
-            k += 1
+    for suffix in (".r.npy", ".theta.npy", ".W.npy"):
+        mm = np.memmap(base.with_suffix(suffix), dtype=np.float64,
+                       mode="w+", shape=(size,))
+        mm.flush()
+        del mm
 
-    r_mm.flush()
-    theta_mm.flush()
-    W_mm.flush()
+    # --------------------------------------------------
+    # Chunk radial rows and fill in parallel
+    # --------------------------------------------------
+    nprocs = max(1, min(int(nprocs), n_r))
+    target_tasks = max(nprocs, target_chunks_per_proc * nprocs)
+    chunk_rows = max(1, int(ceil(n_r / target_tasks)))
+
+    r_path     = str(base.with_suffix(".r.npy"))
+    theta_path = str(base.with_suffix(".theta.npy"))
+    W_path     = str(base.with_suffix(".W.npy"))
+
+    tasks = []
+    for i0 in range(0, n_r, chunk_rows):
+        i1 = min(n_r, i0 + chunk_rows)
+        tasks.append((
+            i0, i1, n_theta, size,
+            r, wr, theta, wt,
+            r_path, theta_path, W_path,
+        ))
+
+    t0 = time.perf_counter()
+    with Pool(processes=nprocs) as pool:
+        for _ in pool.imap_unordered(_fill_polar_rows_worker, tasks):
+            pass
+    t1 = time.perf_counter()
 
     meta = {
-        "version": 1,
+        "version": 2,
         "coord": "polar",
         "n_r": n_r,
         "n_theta": n_theta,
         "u_max": u_max,
         "dim": 2,
+        "build_time_sec": t1 - t0,
+        "cores_used": nprocs,
+        "files": {
+            "r":     base.with_suffix(".r.npy").name,
+            "theta": base.with_suffix(".theta.npy").name,
+            "W":     base.with_suffix(".W.npy").name,
+        },
+        "hostname": os.uname().nodename if hasattr(os, "uname") else None,
         "created": time.time(),
     }
     with open(base.with_suffix(".meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
 
-def _compute_and_store_gl2d_polar_uniform_theta(n_r, n_theta, u_max):
-    """Build and persist a 2D quadrature grid in polar coordinates with a uniform angular sampling."""
+def _compute_and_store_gl2d_polar_uniform_theta(
+    n_r: int,
+    n_theta: int,
+    u_max: float,
+    nprocs: int = NUM_WORKERS,
+    target_chunks_per_proc: int = TARGET_CHUNKS_PER_PROC,
+):
+    """Build and persist a 2D quadrature grid in polar coordinates with uniform angular sampling.
+
+    The radial rule uses GL nodes mapped to [0, u_max]; angles are uniformly
+    spaced over [0, 2π).  The flattened output arrays are filled in parallel
+    by splitting radial rows across ``nprocs`` worker processes.
+
+    Args:
+        n_r:                    Number of GL points in the radial direction.
+        n_theta:                Number of uniform angular points.
+        u_max:                  Outer radius of the integration domain.
+        nprocs:                 Number of worker processes to use.
+        target_chunks_per_proc: Desired number of row-chunks per worker.
+    """
     n_r = int(n_r)
     n_theta = int(n_theta)
     u_max = float(u_max)
@@ -384,34 +474,58 @@ def _compute_and_store_gl2d_polar_uniform_theta(n_r, n_theta, u_max):
     wr = 0.5 * u_max * wi_r
 
     theta = 2.0 * np.pi * np.arange(n_theta) / n_theta
-    wt = 2.0 * np.pi / n_theta
+    wt = 2.0 * np.pi / n_theta  # scalar weight per angular point
 
     size = n_r * n_theta
-    r_mm     = np.memmap(base.with_suffix(".r.npy"), dtype=np.float64, mode="w +", shape=(size,))
-    theta_mm = np.memmap(base.with_suffix(".theta.npy"), dtype=np.float64, mode="w +", shape=(size,))
-    W_mm     = np.memmap(base.with_suffix(".W.npy"), dtype=np.float64, mode="w +", shape=(size,))
 
-    k = 0
-    for i in range(n_r):
-        ri = r[i]
-        wi = wr[i]
-        for j in range(n_theta):
-            r_mm[k]     = ri
-            theta_mm[k] = theta[j]
-            W_mm[k]     = wi * wt * ri   # Jacobian r
-            k += 1
+    for suffix in (".r.npy", ".theta.npy", ".W.npy"):
+        mm = np.memmap(base.with_suffix(suffix), dtype=np.float64,
+                       mode="w+", shape=(size,))
+        mm.flush()
+        del mm
 
-    r_mm.flush()
-    theta_mm.flush()
-    W_mm.flush()
+    # --------------------------------------------------
+    # Chunk radial rows and fill in parallel
+    # --------------------------------------------------
+    nprocs = max(1, min(int(nprocs), n_r))
+    target_tasks = max(nprocs, target_chunks_per_proc * nprocs)
+    chunk_rows = max(1, int(ceil(n_r / target_tasks)))
+
+    r_path     = str(base.with_suffix(".r.npy"))
+    theta_path = str(base.with_suffix(".theta.npy"))
+    W_path     = str(base.with_suffix(".W.npy"))
+
+    tasks = []
+    for i0 in range(0, n_r, chunk_rows):
+        i1 = min(n_r, i0 + chunk_rows)
+        tasks.append((
+            i0, i1, n_theta, size,
+            r, wr, theta, wt,          # wt is a scalar here
+            r_path, theta_path, W_path,
+        ))
+
+    t0 = time.perf_counter()
+    with Pool(processes=nprocs) as pool:
+        for _ in pool.imap_unordered(_fill_polar_rows_worker, tasks):
+            pass
+    t1 = time.perf_counter()
 
     meta = {
-        "version": 1,
+        "version": 2,
         "coord": "polar",
         "theta_rule": "uniform",
         "n_r": n_r,
         "n_theta": n_theta,
         "u_max": u_max,
+        "dim": 2,
+        "build_time_sec": t1 - t0,
+        "cores_used": nprocs,
+        "files": {
+            "r":     base.with_suffix(".r.npy").name,
+            "theta": base.with_suffix(".theta.npy").name,
+            "W":     base.with_suffix(".W.npy").name,
+        },
+        "hostname": os.uname().nodename if hasattr(os, "uname") else None,
         "created": time.time(),
     }
 
