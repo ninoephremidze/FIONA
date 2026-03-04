@@ -652,7 +652,7 @@ class FresnelNUFHT:
                 phase = cos_p + 1j * sin_p
             else:
                 phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
-            F = phase * (w_col / 1j) * g_all
+            F[:] = phase * (w_col / 1j) * g_all
             if self.use_tail_correction:
                 F += 1.0
             step3_loop_end = time.perf_counter()
@@ -981,6 +981,9 @@ class FresnelNUFHTBatched:
         if np.any(w_vec == 0):
             raise ValueError("All w must be nonzero.")
 
+        # Declare module-level context variable for worker sharing (Optimization 2).
+        global _AXISYM_WORKER_CTX
+
         n_w = len(w_vec)
         n_y = len(y_vec)
         nu = 0
@@ -1080,7 +1083,6 @@ class FresnelNUFHTBatched:
 
                 # Optimization 2: fork-based Pool replaces ProcessPoolExecutor.
                 dispatch_start = time.perf_counter()
-                global _AXISYM_WORKER_CTX
                 if self.n_workers == 1:
                     _AXISYM_WORKER_CTX = ctx
                     _init_axisym_worker()
