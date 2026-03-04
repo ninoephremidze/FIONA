@@ -43,6 +43,56 @@ except Exception as e:
     _NUFHT_BATCH_ERR = e
 
 import concurrent.futures
+import multiprocessing as mp
+
+# Optional numexpr for vectorised phase-exponential computation (Optimization 8).
+_HAS_NUMEXPR = False
+try:
+    import numexpr as _ne
+    _ne.evaluate  # verify the symbol exists
+    _HAS_NUMEXPR = True
+except Exception:
+    pass
+
+# Thread-pinning support for worker processes (Optimization 6).
+_AXISYM_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+)
+
+
+def _axisym_set_thread_env(nthreads):
+    """Pin OpenMP / OpenBLAS / MKL thread counts inside a worker process."""
+    n = str(int(nthreads))
+    for var in _AXISYM_THREAD_ENV_VARS:
+        os.environ[var] = n
+
+
+# Module-level worker context (Optimization 2 & 7).
+# Set once in the parent process and inherited by forked children;
+# passed explicitly via initargs when using the "spawn" start method.
+_AXISYM_WORKER_CTX = None
+
+
+def _init_axisym_worker(ctx=None):
+    """
+    Initialise per-process state for axisym worker processes.
+
+    On fork-based multiprocessing the context is inherited from the parent;
+    this function is called with no argument just to pin thread counts.
+    On spawn-based systems ``ctx`` is passed explicitly as an initializer
+    argument.
+    """
+    global _AXISYM_WORKER_CTX
+    if ctx is not None:
+        _AXISYM_WORKER_CTX = ctx
+    _axisym_set_thread_env(1)
+    if _HAS_NUMEXPR:
+        try:
+            _ne.set_num_threads(1)
+        except Exception:
+            pass
 
 
 def _window_taper_1d(r, R, frac):
@@ -75,20 +125,142 @@ def _adaptive_n_gl(w_abs):
     return bin_idx * 1000
 
 
+def _nufht_batch_compute(lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol,
+                          min_physical_radius, n_gl, window_potential,
+                          window_radius_fraction, window_u, window_u_width,
+                          use_tail_correction, xs_fixed=None,
+                          x_weights_fixed=None, integrand_phase_fixed=None):
+    """
+    Core NUFHT computation shared by ``_nufht_batch_worker`` and
+    ``_axisym_batch_task``.
+
+    In fixed mode (``n_gl == 0``) the caller must supply ``xs_fixed``,
+    ``x_weights_fixed``, and ``integrand_phase_fixed``.  In adaptive mode
+    (``n_gl > 0``) those keyword arguments are ignored.
+
+    Implements:
+    - Optimization 1: group fixed-mode frequencies by quantised |w| and call
+      ``nufht_batch`` once per bin when available.
+    - Optimization 3: vectorised coefficient computation via broadcasting.
+    - Optimization 8: numexpr for the phase-exponential evaluation.
+
+    Returns
+    -------
+    G_re, G_im : ndarray of shape (n_y, batch)
+    """
+    import _pynufht as pn
+
+    n_y = y_vec.size
+    batch = len(w_chunk)
+    G_re = np.empty((n_y, batch), dtype=float)
+    G_im = np.empty((n_y, batch), dtype=float)
+
+    if n_gl == 0:  # ── Fixed mode: xs is the same for every frequency ────────
+        xs = xs_fixed
+        x_weights = x_weights_fixed
+        integrand_phase = integrand_phase_fixed
+
+        # Optimization 3: vectorised coefficient computation
+        phase_matrix = np.outer(w_chunk, integrand_phase)  # (batch, m)
+        if _HAS_NUMEXPR:
+            cos_p = _ne.evaluate("cos(phase_matrix)")
+            sin_p = _ne.evaluate("sin(phase_matrix)")
+            fw_matrix = cos_p + 1j * sin_p
+        else:
+            fw_matrix = np.exp(1j * phase_matrix)
+
+        if use_tail_correction:
+            free_phase = np.outer(w_chunk, 0.5 * xs ** 2)
+            if _HAS_NUMEXPR:
+                cos_f = _ne.evaluate("cos(free_phase)")
+                sin_f = _ne.evaluate("sin(free_phase)")
+                fw_matrix -= cos_f + 1j * sin_f
+            else:
+                fw_matrix -= np.exp(1j * free_phase)
+
+        ck_matrix = x_weights[np.newaxis, :] * fw_matrix  # (batch, m)
+
+        # Optimization 1: group by quantised |w| → call nufht_batch per bin
+        w_abs = np.abs(w_chunk)
+        w_abs_q = np.round(w_abs, 6)
+        unique_abs_w = np.unique(w_abs_q)
+
+        if _HAS_NUFHT_BATCH and len(unique_abs_w) < batch:
+            for abs_w in unique_abs_w:
+                bin_idx = np.where(w_abs_q == abs_w)[0]
+                out_pts = abs_w * y_vec
+                if len(bin_idx) > 1:
+                    ck_bin_re = np.asfortranarray(ck_matrix[bin_idx, :].real.T)
+                    ck_bin_im = np.asfortranarray(ck_matrix[bin_idx, :].imag.T)
+                    G_re[:, bin_idx] = pn.nufht_batch(
+                        nu, xs, ck_bin_re, out_pts, tol=tol)
+                    G_im[:, bin_idx] = pn.nufht_batch(
+                        nu, xs, ck_bin_im, out_pts, tol=tol)
+                else:
+                    j = bin_idx[0]
+                    G_re[:, j] = pn.nufht(
+                        nu, xs, np.ascontiguousarray(ck_matrix[j].real),
+                        out_pts, tol=tol)
+                    G_im[:, j] = pn.nufht(
+                        nu, xs, np.ascontiguousarray(ck_matrix[j].imag),
+                        out_pts, tol=tol)
+        else:
+            for j in range(batch):
+                out_pts = w_abs[j] * y_vec
+                G_re[:, j] = pn.nufht(
+                    nu, xs, np.ascontiguousarray(ck_matrix[j].real),
+                    out_pts, tol=tol)
+                G_im[:, j] = pn.nufht(
+                    nu, xs, np.ascontiguousarray(ck_matrix[j].imag),
+                    out_pts, tol=tol)
+
+    else:  # ── Adaptive mode: xs differs per frequency ────────────────────────
+        for j, w in enumerate(w_chunk):
+            Xmax_w = max(min_physical_radius, np.sqrt(n_gl / (2.0 * abs(w))))
+            xs = rs_unit * Xmax_w
+            x_weights = xs * (w_unit * Xmax_w)
+            if window_u:
+                x_weights = x_weights * _window_u_taper_1d(
+                    xs, Xmax_w, window_u_width)
+            psi_vals = lens.psi_r(xs)
+            if window_potential:
+                psi_vals = psi_vals * _window_taper_1d(
+                    xs, Xmax_w, window_radius_fraction)
+            integrand_phase = 0.5 * xs ** 2 - psi_vals
+
+            # Optimization 8: numexpr for per-frequency phase exponential
+            phase_w = w * integrand_phase
+            if _HAS_NUMEXPR:
+                cos_p = _ne.evaluate("cos(phase_w)")
+                sin_p = _ne.evaluate("sin(phase_w)")
+                fw = cos_p + 1j * sin_p
+            else:
+                fw = np.exp(1j * phase_w)
+
+            if use_tail_correction:
+                free_phase_w = w * 0.5 * xs ** 2
+                if _HAS_NUMEXPR:
+                    cos_f = _ne.evaluate("cos(free_phase_w)")
+                    sin_f = _ne.evaluate("sin(free_phase_w)")
+                    fw -= cos_f + 1j * sin_f
+                else:
+                    fw -= np.exp(1j * free_phase_w)
+
+            ck = x_weights * fw
+            out_pts = abs(w) * y_vec
+            G_re[:, j] = pn.nufht(nu, xs, ck.real.copy(), out_pts, tol=tol)
+            G_im[:, j] = pn.nufht(nu, xs, ck.imag.copy(), out_pts, tol=tol)
+
+    return G_re, G_im
+
+
 def _nufht_batch_worker(args):
     """
     Top-level worker function (must be module-level for picklability).
 
-    Receives a chunk of frequencies and unit GL nodes, then for each frequency
-    computes the per-frequency x-domain integration radius
-    Xmax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))), rescales the
-    unit nodes to x-space, and calls ``pn.nufht`` individually (since output
-    points ``|w|*y_vec`` differ per frequency).
-
-    When ``n_gl == 0`` (fixed mode), uses ``Xmax = min_physical_radius`` for
-    all frequencies without per-frequency adaptation; in that case the x-nodes
-    are the same for every w and ``integrand_phase = x²/2 − ψ(x)`` is
-    precomputed once.
+    Kept for backward compatibility; delegates to ``_nufht_batch_compute``.
+    In fixed mode (``n_gl == 0``) the x-nodes and integrand phase are
+    precomputed here before handing off to the shared core.
 
     Parameters
     ----------
@@ -96,26 +268,16 @@ def _nufht_batch_worker(args):
         (lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl,
         window_potential, window_radius_fraction, window_u, window_u_width,
         use_tail_correction)
-        where ``rs_unit`` and ``w_unit`` are GL nodes/weights on the unit interval.
 
     Returns
     -------
     G_re, G_im : ndarray of shape (n_y, batch)
     """
-    import _pynufht as pn
-    import numpy as np
-
     (lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol, min_physical_radius, n_gl,
      window_potential, window_radius_fraction, window_u, window_u_width,
      use_tail_correction) = args
 
-    n_y = y_vec.size
-    batch = len(w_chunk)
-
-    G_re = np.empty((n_y, batch), dtype=float)
-    G_im = np.empty((n_y, batch), dtype=float)
-
-    # Fixed mode: precompute x-nodes and integrand_phase once for all frequencies.
+    xs_fixed = x_weights_fixed = integrand_phase_fixed = None
     if n_gl == 0:
         Xmax = min_physical_radius
         xs_fixed = rs_unit * Xmax
@@ -127,39 +289,42 @@ def _nufht_batch_worker(args):
         if window_potential:
             psi_fixed = psi_fixed * _window_taper_1d(
                 xs_fixed, Xmax, window_radius_fraction)
-        integrand_phase_fixed = 0.5 * xs_fixed**2 - psi_fixed
+        integrand_phase_fixed = 0.5 * xs_fixed ** 2 - psi_fixed
 
-    for j, w in enumerate(w_chunk):
-        # Per-frequency x-domain integration radius
-        if n_gl > 0:
-            Xmax_w = max(min_physical_radius, np.sqrt(n_gl / (2.0 * abs(w))))
-            xs = rs_unit * Xmax_w
-            x_weights = xs * (w_unit * Xmax_w)
-            if window_u:
-                x_weights = x_weights * _window_u_taper_1d(xs, Xmax_w, window_u_width)
-            psi_vals = lens.psi_r(xs)
-            if window_potential:
-                psi_vals = psi_vals * _window_taper_1d(xs, Xmax_w, window_radius_fraction)
-            integrand_phase = 0.5 * xs**2 - psi_vals
-        else:
-            xs = xs_fixed
-            x_weights = x_weights_fixed
-            integrand_phase = integrand_phase_fixed
+    return _nufht_batch_compute(
+        lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol,
+        min_physical_radius, n_gl, window_potential, window_radius_fraction,
+        window_u, window_u_width, use_tail_correction,
+        xs_fixed=xs_fixed, x_weights_fixed=x_weights_fixed,
+        integrand_phase_fixed=integrand_phase_fixed)
 
-        # fw = exp(iw * (x²/2 − ψ(x))); subtract free-space term for tail correction
-        if use_tail_correction:
-            fw = (np.exp(1j * w * integrand_phase)
-                  - np.exp(1j * w * 0.5 * xs**2))
-        else:
-            fw = np.exp(1j * w * integrand_phase)
-        ck = x_weights * fw
 
-        # NUFHT output points are |w|·y (x-domain: J₀(w·x·y) = J₀(|w|·x·y))
-        out_pts = abs(w) * y_vec
-        G_re[:, j] = pn.nufht(nu, xs, ck.real, out_pts, tol=tol)
-        G_im[:, j] = pn.nufht(nu, xs, ck.imag, out_pts, tol=tol)
+def _axisym_batch_task(w_indices):
+    """
+    Context-aware worker entry-point for fork / spawn Pool dispatch.
 
-    return G_re, G_im
+    Reads all shared data from the module-level ``_AXISYM_WORKER_CTX``
+    (set by the parent before forking, or passed via the pool initializer
+    for spawn).  Only ``w_indices`` — indices into the context's ``w_vec``
+    — are transferred per task, minimising pickle payload (Optimization 7).
+
+    Returns
+    -------
+    w_indices, G_re, G_im
+        ``w_indices`` echoed back so the caller can assemble results in any
+        order (compatible with ``imap_unordered``).
+    """
+    ctx = _AXISYM_WORKER_CTX
+    w_chunk = ctx["w_vec"][w_indices]
+    G_re, G_im = _nufht_batch_compute(
+        ctx["lens"], ctx["rs_unit"], ctx["w_unit"], ctx["y_vec"],
+        w_chunk, ctx["nu"], ctx["tol"], ctx["min_physical_radius"],
+        ctx["n_gl"], ctx["window_potential"], ctx["window_radius_fraction"],
+        ctx["window_u"], ctx["window_u_width"], ctx["use_tail_correction"],
+        xs_fixed=ctx.get("xs_fixed"),
+        x_weights_fixed=ctx.get("x_weights_fixed"),
+        integrand_phase_fixed=ctx.get("integrand_phase_fixed"))
+    return w_indices, G_re, G_im
 
 
 def _pct(part, total):
@@ -263,43 +428,52 @@ class FresnelNUFHT:
                 )
         self._gl_dir = gl_dir
 
-        # Don't load nodes yet - will be loaded in __call__ based on frequency range
+        # Optimization 4: in-memory GL-node cache.
+        # _gl_cache: n_gl -> (rs_unit, w_unit) for unit-interval nodes.
+        # _gl_nodes_cache: (n_gl, Xmax) -> (xs, x_weights) for scaled nodes.
+        self._gl_cache = {}
+        self._gl_nodes_cache = {}
 
     def _load_gl_nodes(self, Xmax):
         """
         Load or compute GL nodes for given Xmax (x-domain integration radius).
         Uses gauss_legendre_1d from utils, which computes on-the-fly if needed.
+        Results are cached in ``_gl_nodes_cache`` (Optimization 4).
         """
-        # Set FIONA_GL2D_DIR temporarily if needed
+        key = (self.gl_nodes_per_dim, Xmax)
+        if key in self._gl_nodes_cache:
+            return self._gl_nodes_cache[key]
         old_env = os.environ.get("FIONA_GL2D_DIR")
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
-            
             x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Xmax)
-            
-            # Keep only positive x (symmetry of Gauss–Legendre)
             mask = x > 0
-            xs = x[mask]            # x_k
-            dx = w[mask]            # Δx_k
-            x_weights = xs * dx     # x_k Δx_k for ∫ x f(x) dx
-
-            return xs.astype(float), x_weights.astype(float)
+            xs = x[mask].astype(float)
+            x_weights = xs * w[mask].astype(float)
+            result = (xs, x_weights)
+            self._gl_nodes_cache[key] = result
+            return result
         finally:
-            # Restore old environment variable
             if old_env is None:
                 os.environ.pop("FIONA_GL2D_DIR", None)
             else:
                 os.environ["FIONA_GL2D_DIR"] = old_env
 
     def _load_gl_nodes_unit(self):
-        """Load or compute GL nodes on the unit interval [-1, 1]."""
+        """Load or compute GL nodes on the unit interval [-1, 1].
+        Results are cached in ``_gl_cache`` (Optimization 4).
+        """
+        n_gl = self.gl_nodes_per_dim
+        if n_gl in self._gl_cache:
+            return self._gl_cache[n_gl]
         old_env = os.environ.get("FIONA_GL2D_DIR")
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
-            x, w = gauss_legendre_1d(self.gl_nodes_per_dim, 1.0)
+            x, w = gauss_legendre_1d(n_gl, 1.0)
             mask = x > 0
             rs_unit = x[mask].astype(float)
             w_unit = w[mask].astype(float)
+            self._gl_cache[n_gl] = (rs_unit, w_unit)
             return rs_unit, w_unit
         finally:
             if old_env is None:
@@ -364,8 +538,29 @@ class FresnelNUFHT:
             mul_time = 0.0
             assign_time = 0.0
 
-            for i, w in enumerate(w_vec):
-                if self.auto_R_from_gl_nodes:
+            if not self.auto_R_from_gl_nodes:
+                # Optimization 3: vectorised coefficient computation for fixed mode.
+                xs_per_freq = [xs_fixed] * n_w
+                phase_matrix = np.outer(w_vec, integrand_phase_fixed)  # (n_w, m)
+                if _HAS_NUMEXPR:
+                    cos_p = _ne.evaluate("cos(phase_matrix)")
+                    sin_p = _ne.evaluate("sin(phase_matrix)")
+                    fw_matrix = cos_p + 1j * sin_p
+                else:
+                    fw_matrix = np.exp(1j * phase_matrix)
+                if self.use_tail_correction:
+                    free_phase = np.outer(w_vec, 0.5 * xs_fixed ** 2)
+                    if _HAS_NUMEXPR:
+                        cos_f = _ne.evaluate("cos(free_phase)")
+                        sin_f = _ne.evaluate("sin(free_phase)")
+                        fw_matrix -= cos_f + 1j * sin_f
+                    else:
+                        fw_matrix -= np.exp(1j * free_phase)
+                ck_matrix = x_weights_fixed[np.newaxis, :] * fw_matrix  # (n_w, m)
+                c_re[:] = ck_matrix.real
+                c_im[:] = ck_matrix.imag
+            else:
+                for i, w in enumerate(w_vec):
                     # Adaptive mode: compute x-nodes and integrand_phase per frequency
                     Xmax_w = max(self.min_physical_radius,
                                  np.sqrt(n_gl / (2.0 * abs(w))))
@@ -388,36 +583,39 @@ class FresnelNUFHT:
                     # integrand phase: x²/2 − ψ(x)
                     integrand_phase = 0.5 * xs**2 - psi_vals
                     t_c = time.perf_counter()
-                else:
-                    # Fixed mode: reuse precomputed quantities
-                    xs = xs_fixed
-                    x_weights = x_weights_fixed
-                    xs_per_freq.append(xs)
-                    integrand_phase = integrand_phase_fixed
-                    t_a = t_b = t_c = time.perf_counter()
 
-                # fw = exp(iw · (x²/2 − ψ(x))); subtract free-space for tail correction
-                if self.use_tail_correction:
-                    fw = (np.exp(1j * w * integrand_phase)
-                          - np.exp(1j * w * 0.5 * xs**2))
-                else:
-                    fw = np.exp(1j * w * integrand_phase)
-                t_d = time.perf_counter()
+                    # Optimization 8: numexpr for phase exponential
+                    phase_w = w * integrand_phase
+                    if _HAS_NUMEXPR:
+                        cos_p = _ne.evaluate("cos(phase_w)")
+                        sin_p = _ne.evaluate("sin(phase_w)")
+                        fw = cos_p + 1j * sin_p
+                    else:
+                        fw = np.exp(1j * phase_w)
+                    if self.use_tail_correction:
+                        free_phase_w = w * 0.5 * xs ** 2
+                        if _HAS_NUMEXPR:
+                            cos_f = _ne.evaluate("cos(free_phase_w)")
+                            sin_f = _ne.evaluate("sin(free_phase_w)")
+                            fw -= cos_f + 1j * sin_f
+                        else:
+                            fw -= np.exp(1j * free_phase_w)
+                    t_d = time.perf_counter()
 
-                # coefficients c_k(w) = x_k Δx_k f_w(x_k)
-                ck = x_weights * fw
-                t_e = time.perf_counter()
+                    # coefficients c_k(w) = x_k Δx_k f_w(x_k)
+                    ck = x_weights * fw
+                    t_e = time.perf_counter()
 
-                # write into batches
-                c_re[i,:] = ck.real
-                c_im[i,:] = ck.imag
-                t_f = time.perf_counter()
+                    # write into batches
+                    c_re[i, :] = ck.real
+                    c_im[i, :] = ck.imag
+                    t_f = time.perf_counter()
 
-                # accumulate sub-timings
-                psi_time    += (t_b - t_a)
-                phase_time  += (t_d - t_c)
-                mul_time    += (t_e - t_d)
-                assign_time += (t_f - t_e)
+                    # accumulate sub-timings
+                    psi_time    += (t_b - t_a)
+                    phase_time  += (t_d - t_c)
+                    mul_time    += (t_e - t_d)
+                    assign_time += (t_f - t_e)
 
             coeff_loop_end = time.perf_counter()
             step1_end = coeff_loop_end
@@ -441,14 +639,22 @@ class FresnelNUFHT:
             nufht_call_end = time.perf_counter()
             step2_end = nufht_call_end
 
-            # ---------- Step 3: Assemble full Fresnel integral (Python) ----------
+            # ---------- Step 3: Assemble full Fresnel integral ----------
+            # Optimization 5: vectorised final assembly.
             # F = e^{iwy²/2} · (w/i) · g   [x-domain prefactor]
             step3_loop_start = time.perf_counter()
-            for i, w in enumerate(w_vec):
-                g = g_re[i] + 1j*g_im[i]
-                F[i,:] = np.exp(1j*w*quad_phase) * (w / 1j) * g
-                if self.use_tail_correction:
-                    F[i,:] = 1.0 + F[i,:]
+            g_all = g_re + 1j * g_im                            # (n_w, n_y)
+            w_col = w_vec[:, np.newaxis]                         # (n_w, 1)
+            if _HAS_NUMEXPR:
+                phase_arg = w_col * quad_phase[np.newaxis, :]    # (n_w, n_y)
+                cos_p = _ne.evaluate("cos(phase_arg)")
+                sin_p = _ne.evaluate("sin(phase_arg)")
+                phase = cos_p + 1j * sin_p
+            else:
+                phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
+            F = phase * (w_col / 1j) * g_all
+            if self.use_tail_correction:
+                F += 1.0
             step3_loop_end = time.perf_counter()
             step3_end = step3_loop_end
 
@@ -700,19 +906,29 @@ class FresnelNUFHTBatched:
                 )
         self._gl_dir = gl_dir
 
+        # Optimization 4: in-memory GL-node cache.
+        self._gl_cache = {}        # n_gl -> (rs_unit, w_unit)
+        self._gl_nodes_cache = {}  # (n_gl, Xmax) -> (xs, x_weights)
+
     def _load_gl_nodes(self, Xmax, n_gl=None):
-        """Load or compute GL nodes for given *Xmax* (x-domain radius) and *n_gl*."""
+        """Load or compute GL nodes for given *Xmax* and *n_gl*.
+        Results are cached in ``_gl_nodes_cache`` (Optimization 4).
+        """
         if n_gl is None:
             n_gl = self.gl_nodes_per_dim
+        key = (n_gl, Xmax)
+        if key in self._gl_nodes_cache:
+            return self._gl_nodes_cache[key]
         old_env = os.environ.get("FIONA_GL2D_DIR")
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
             x, w = gauss_legendre_1d(n_gl, Xmax)
             mask = x > 0
             xs = x[mask].astype(float)
-            dx = w[mask].astype(float)
-            x_weights = xs * dx
-            return xs, x_weights
+            x_weights = xs * w[mask].astype(float)
+            result = (xs, x_weights)
+            self._gl_nodes_cache[key] = result
+            return result
         finally:
             if old_env is None:
                 os.environ.pop("FIONA_GL2D_DIR", None)
@@ -720,9 +936,13 @@ class FresnelNUFHTBatched:
                 os.environ["FIONA_GL2D_DIR"] = old_env
 
     def _load_gl_nodes_unit(self, n_gl=None):
-        """Load or compute GL nodes on the unit interval [-1, 1] for given *n_gl*."""
+        """Load or compute GL nodes on the unit interval [-1, 1] for *n_gl*.
+        Results are cached in ``_gl_cache`` (Optimization 4).
+        """
         if n_gl is None:
             n_gl = self.gl_nodes_per_dim
+        if n_gl in self._gl_cache:
+            return self._gl_cache[n_gl]
         old_env = os.environ.get("FIONA_GL2D_DIR")
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
@@ -730,6 +950,7 @@ class FresnelNUFHTBatched:
             mask = x > 0
             rs_unit = x[mask].astype(float)
             w_unit = w[mask].astype(float)
+            self._gl_cache[n_gl] = (rs_unit, w_unit)
             return rs_unit, w_unit
         finally:
             if old_env is None:
@@ -796,12 +1017,19 @@ class FresnelNUFHTBatched:
             dispatch_time = 0.0
             assembly_time = 0.0
 
+            # Determine multiprocessing start method once (Optimization 2).
+            try:
+                _mp_fork_ctx = mp.get_context("fork")
+                _axisym_mp_method = "fork"
+            except Exception:
+                _mp_fork_ctx = mp.get_context()
+                _axisym_mp_method = "spawn"
+
             for n_gl, idxs in group_items:
                 w_sub = w_vec[idxs]
+                n_sub = len(idxs)
 
                 # Load GL nodes on the unit interval [-1, 1] once per group.
-                # Each worker will rescale them per frequency using
-                # Xmax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))).
                 gl_start = time.perf_counter()
                 rs_unit, w_unit = self._load_gl_nodes_unit(n_gl)
                 gl_end = time.perf_counter()
@@ -811,45 +1039,91 @@ class FresnelNUFHTBatched:
                 # 0 signals fixed mode (Xmax = min_physical_radius for all w).
                 n_gl_for_worker = n_gl if self.auto_R_from_gl_nodes else 0
 
+                # Build the shared context for this group (Optimizations 2 & 7).
+                ctx = {
+                    "lens": self.lens,
+                    "rs_unit": rs_unit,
+                    "w_unit": w_unit,
+                    "y_vec": y_vec,
+                    "w_vec": w_sub,
+                    "nu": nu,
+                    "tol": self.tol,
+                    "min_physical_radius": self.min_physical_radius,
+                    "n_gl": n_gl_for_worker,
+                    "window_potential": self.window_potential,
+                    "window_radius_fraction": self.window_radius_fraction,
+                    "window_u": self.window_u,
+                    "window_u_width": self.window_u_width,
+                    "use_tail_correction": self.use_tail_correction,
+                }
+                # Optimization 7: precompute fixed-mode quantities in the parent
+                # so workers need not call lens.psi_r at all.
+                if n_gl_for_worker == 0:
+                    Xmax = self.min_physical_radius
+                    xs_f = rs_unit * Xmax
+                    xw_f = xs_f * (w_unit * Xmax)
+                    if self.window_u:
+                        xw_f = xw_f * _window_u_taper_1d(
+                            xs_f, Xmax, self.window_u_width)
+                    psi_f = self.lens.psi_r(xs_f)
+                    if self.window_potential:
+                        psi_f = psi_f * _window_taper_1d(
+                            xs_f, Xmax, self.window_radius_fraction)
+                    ctx["xs_fixed"] = xs_f
+                    ctx["x_weights_fixed"] = xw_f
+                    ctx["integrand_phase_fixed"] = 0.5 * xs_f ** 2 - psi_f
+
                 # Split this group's frequencies into chunks for parallel workers
-                n_sub = len(idxs)
-                n_chunks = min(self.n_workers, n_sub)
-                if n_chunks < 1:
-                    n_chunks = 1
+                n_chunks = max(1, min(self.n_workers, n_sub))
                 chunk_splits = np.array_split(np.arange(n_sub), n_chunks)
+                tasks = [ch for ch in chunk_splits if len(ch) > 0]
 
-                worker_args = [
-                    (self.lens, rs_unit, w_unit, y_vec, w_sub[ch], nu, self.tol,
-                     self.min_physical_radius, n_gl_for_worker,
-                     self.window_potential, self.window_radius_fraction,
-                     self.window_u, self.window_u_width, self.use_tail_correction)
-                    for ch in chunk_splits
-                    if len(ch) > 0
-                ]
-                # Track which global indices each chunk covers
-                valid_chunks = [ch for ch in chunk_splits if len(ch) > 0]
-
+                # Optimization 2: fork-based Pool replaces ProcessPoolExecutor.
                 dispatch_start = time.perf_counter()
+                global _AXISYM_WORKER_CTX
                 if self.n_workers == 1:
-                    results = [_nufht_batch_worker(a) for a in worker_args]
+                    _AXISYM_WORKER_CTX = ctx
+                    _init_axisym_worker()
+                    results_raw = [_axisym_batch_task(ch) for ch in tasks]
                 else:
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=self.n_workers
-                    ) as executor:
-                        results = list(executor.map(_nufht_batch_worker, worker_args))
+                    if _axisym_mp_method == "fork":
+                        _AXISYM_WORKER_CTX = ctx
+                        _init_axisym_worker()
+                        pool = _mp_fork_ctx.Pool(
+                            processes=self.n_workers,
+                            initializer=_init_axisym_worker)
+                    else:
+                        pool = _mp_fork_ctx.Pool(
+                            processes=self.n_workers,
+                            initializer=_init_axisym_worker,
+                            initargs=(ctx,))
+                    try:
+                        results_raw = list(pool.imap_unordered(
+                            _axisym_batch_task, tasks, chunksize=1))
+                    finally:
+                        pool.close()
+                        pool.join()
                 dispatch_end = time.perf_counter()
                 dispatch_time += dispatch_end - dispatch_start
 
-                # Assemble results for this group
+                # Optimization 5: vectorised result assembly.
                 assembly_start = time.perf_counter()
-                for ch, (G_re, G_im) in zip(valid_chunks, results):
-                    for j, sub_j in enumerate(ch):
-                        i = idxs[sub_j]
-                        w = w_vec[i]
-                        g = G_re[:, j] + 1j * G_im[:, j]
-                        F[i, :] = np.exp(1j * w * quad_phase) * (w / 1j) * g
-                        if self.use_tail_correction:
-                            F[i, :] = 1.0 + F[i, :]
+                for w_indices, G_re, G_im in results_raw:
+                    global_indices = idxs[w_indices]
+                    w_chunk = w_sub[w_indices]
+                    w_col = w_chunk[:, np.newaxis]          # (batch, 1)
+                    g_T = (G_re + 1j * G_im).T             # (batch, n_y)
+                    if _HAS_NUMEXPR:
+                        phase_arg = w_col * quad_phase[np.newaxis, :]
+                        cos_p = _ne.evaluate("cos(phase_arg)")
+                        sin_p = _ne.evaluate("sin(phase_arg)")
+                        phase = cos_p + 1j * sin_p
+                    else:
+                        phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
+                    chunk_F = phase * (w_col / 1j) * g_T   # (batch, n_y)
+                    if self.use_tail_correction:
+                        chunk_F += 1.0
+                    F[global_indices, :] = chunk_F
                 assembly_end = time.perf_counter()
                 assembly_time += assembly_end - assembly_start
 
@@ -1115,14 +1389,22 @@ class FresnelHankelAxisymmetricTrapezoidal:
 
             t2 = nufht_call_end
 
-            # ---------------- Step 3: Final assembly in Python ----------------
+            # ---------------- Step 3: Final assembly ----------
+            # Optimization 5: vectorised final assembly.
             # F = e^{iwy²/2} · (w/i) · g   [x-domain prefactor]
             final_loop_start = time.perf_counter()
-            for i, w in enumerate(w_vec):
-                g = g_re[i, :] + 1j * g_im[i, :]
-                F[i, :] = np.exp(1j * w * quad_phase) * (w / 1j) * g
-                if self.use_tail_correction:
-                    F[i, :] = 1.0 + F[i, :]
+            g_all = g_re + 1j * g_im                            # (n_w, n_y)
+            w_col = w_vec[:, np.newaxis]                         # (n_w, 1)
+            if _HAS_NUMEXPR:
+                phase_arg = w_col * quad_phase[np.newaxis, :]    # (n_w, n_y)
+                cos_p = _ne.evaluate("cos(phase_arg)")
+                sin_p = _ne.evaluate("sin(phase_arg)")
+                phase = cos_p + 1j * sin_p
+            else:
+                phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
+            F = phase * (w_col / 1j) * g_all
+            if self.use_tail_correction:
+                F += 1.0
             final_loop_end = time.perf_counter()
             t3 = final_loop_end
 
@@ -1317,39 +1599,36 @@ class FresnelHankelAxisymmetricSciPy:
                 )
         self._gl_dir = gl_dir
 
-        # Don't load nodes yet - will be loaded in __call__ based on frequency range
+        # Optimization 4: in-memory cache for _load_and_setup_grid results.
+        self._gl_cache = {}  # (n_gl, Xmax) -> (r, dln, mu, bias, offset, k)
 
     def _load_and_setup_grid(self, Xmax):
         """
-        Load or compute GL nodes for given Xmax (x-domain radius) and setup FFTLog grid.
-        Uses gauss_legendre_1d from utils, which computes on-the-fly if needed.
+        Load or compute GL nodes for given Xmax and setup FFTLog grid.
+        Results are cached in ``_gl_cache`` (Optimization 4).
         """
-        # Set FIONA_GL2D_DIR temporarily if needed
+        key = (self.gl_nodes_per_dim, Xmax)
+        if key in self._gl_cache:
+            return self._gl_cache[key]
         old_env = os.environ.get("FIONA_GL2D_DIR")
         try:
             os.environ["FIONA_GL2D_DIR"] = self._gl_dir
-            
             x, w = gauss_legendre_1d(self.gl_nodes_per_dim, Xmax)
-            
             mask = x > 0
-            xs_gl = x[mask]      # original GL radial nodes x_k
-
-            # We use the GL nodes to define the radial range and sample count
+            xs_gl = x[mask]
             r_min = float(xs_gl.min())
             r_max = float(xs_gl.max())
             n_r = xs_gl.size
-
-            # --- Build logarithmic radial grid, r_j = r_c * exp[(j-j_c)*dln] ---
             r = np.geomspace(r_min, r_max, n_r)
             dln = float(np.log(r[1] / r[0]))
             mu = 0.0
             bias = 0.0
             offset = _scipy_fhtoffset(dln, mu=mu, bias=bias)
             k = np.exp(offset) / r[::-1]
-
-            return r, dln, mu, bias, offset, k
+            result = r, dln, mu, bias, offset, k
+            self._gl_cache[key] = result
+            return result
         finally:
-            # Restore old environment variable
             if old_env is None:
                 os.environ.pop("FIONA_GL2D_DIR", None)
             else:
