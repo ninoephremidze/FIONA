@@ -635,6 +635,11 @@ class FresnelNUFHTBatched:
     n_workers : int, optional
         Number of parallel worker processes (default 112).  Set to 1
         to run in-process without a ``ProcessPoolExecutor``.
+    print_timing : bool, optional
+        If ``True`` (default), print a timing/performance summary after each
+        ``__call__`` invocation, including total runtime and a breakdown of
+        major phases (setup, GL node loading, worker dispatch, result
+        assembly).  Set to ``False`` to silence all timing output.
     """
 
     _DEFAULT_WORKERS = 112
@@ -652,7 +657,8 @@ class FresnelNUFHTBatched:
                  window_radius_fraction: float = 0.75,
                  window_u: bool = True,
                  window_u_width: float = 0.02,
-                 use_tail_correction: bool = True):
+                 use_tail_correction: bool = True,
+                 print_timing: bool = True):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelNUFHTBatched requires AxisymmetricLens")
@@ -683,6 +689,7 @@ class FresnelNUFHTBatched:
         self.window_u = bool(window_u)
         self.window_u_width = float(window_u_width)
         self.use_tail_correction = bool(use_tail_correction)
+        self.print_timing = bool(print_timing)
 
         if gl_dir is None:
             gl_dir = os.environ.get("FIONA_GL2D_DIR", "")
@@ -755,71 +762,137 @@ class FresnelNUFHTBatched:
 
         n_w = len(w_vec)
         n_y = len(y_vec)
-        F = np.empty((n_w, n_y), dtype=np.complex128)
-        quad_phase = 0.5 * y_vec ** 2
         nu = 0
 
-        # Group frequencies by n_gl bin (adaptive) or use a single group (fixed)
-        if self.adaptive_n_gl:
-            w_abs = np.abs(w_vec)
-            n_gl_vec = np.array([_adaptive_n_gl(v) for v in w_abs], dtype=int)
-            groups = {}
-            for idx, n_gl in enumerate(n_gl_vec):
-                groups.setdefault(n_gl, []).append(idx)
-            group_items = [
-                (n_gl, np.asarray(idxs, dtype=int))
-                for n_gl, idxs in sorted(groups.items())
-            ]
-        else:
-            group_items = [(self.gl_nodes_per_dim, np.arange(n_w, dtype=int))]
+        # ───────────────────────────────
+        # Wall-clock timing
+        # ───────────────────────────────
+        t0 = time.perf_counter()
 
-        for n_gl, idxs in group_items:
-            w_sub = w_vec[idxs]
+        with CPUTracker() as tracker:
 
-            # Load GL nodes on the unit interval [-1, 1] once per group.
-            # Each worker will rescale them per frequency using
-            # Xmax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))).
-            rs_unit, w_unit = self._load_gl_nodes_unit(n_gl)
+            # ---------- Step 0: Setup ----------
+            setup_start = time.perf_counter()
+            F = np.empty((n_w, n_y), dtype=np.complex128)
+            quad_phase = 0.5 * y_vec ** 2
 
-            # n_gl_for_worker > 0 enables per-frequency Xmax adaptation;
-            # 0 signals fixed mode (Xmax = min_physical_radius for all w).
-            n_gl_for_worker = n_gl if self.auto_R_from_gl_nodes else 0
-
-            # Split this group's frequencies into chunks for parallel workers
-            n_sub = len(idxs)
-            n_chunks = min(self.n_workers, n_sub)
-            if n_chunks < 1:
-                n_chunks = 1
-            chunk_splits = np.array_split(np.arange(n_sub), n_chunks)
-
-            worker_args = [
-                (self.lens, rs_unit, w_unit, y_vec, w_sub[ch], nu, self.tol,
-                 self.min_physical_radius, n_gl_for_worker,
-                 self.window_potential, self.window_radius_fraction,
-                 self.window_u, self.window_u_width, self.use_tail_correction)
-                for ch in chunk_splits
-                if len(ch) > 0
-            ]
-            # Track which global indices each chunk covers
-            valid_chunks = [ch for ch in chunk_splits if len(ch) > 0]
-
-            if self.n_workers == 1:
-                results = [_nufht_batch_worker(a) for a in worker_args]
+            # Group frequencies by n_gl bin (adaptive) or use a single group (fixed)
+            if self.adaptive_n_gl:
+                w_abs = np.abs(w_vec)
+                n_gl_vec = np.array([_adaptive_n_gl(v) for v in w_abs], dtype=int)
+                groups = {}
+                for idx, n_gl in enumerate(n_gl_vec):
+                    groups.setdefault(n_gl, []).append(idx)
+                group_items = [
+                    (n_gl, np.asarray(idxs, dtype=int))
+                    for n_gl, idxs in sorted(groups.items())
+                ]
             else:
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=self.n_workers
-                ) as executor:
-                    results = list(executor.map(_nufht_batch_worker, worker_args))
+                group_items = [(self.gl_nodes_per_dim, np.arange(n_w, dtype=int))]
+            setup_end = time.perf_counter()
 
-            # Assemble results for this group
-            for ch, (G_re, G_im) in zip(valid_chunks, results):
-                for j, sub_j in enumerate(ch):
-                    i = idxs[sub_j]
-                    w = w_vec[i]
-                    g = G_re[:, j] + 1j * G_im[:, j]
-                    F[i, :] = np.exp(1j * w * quad_phase) * (w / 1j) * g
-                    if self.use_tail_correction:
-                        F[i, :] = 1.0 + F[i, :]
+            # Accumulators for per-group phases
+            gl_load_time = 0.0
+            dispatch_time = 0.0
+            assembly_time = 0.0
+
+            for n_gl, idxs in group_items:
+                w_sub = w_vec[idxs]
+
+                # Load GL nodes on the unit interval [-1, 1] once per group.
+                # Each worker will rescale them per frequency using
+                # Xmax(w) = max(min_physical_radius, sqrt(n_gl / (2*|w|))).
+                gl_start = time.perf_counter()
+                rs_unit, w_unit = self._load_gl_nodes_unit(n_gl)
+                gl_end = time.perf_counter()
+                gl_load_time += gl_end - gl_start
+
+                # n_gl_for_worker > 0 enables per-frequency Xmax adaptation;
+                # 0 signals fixed mode (Xmax = min_physical_radius for all w).
+                n_gl_for_worker = n_gl if self.auto_R_from_gl_nodes else 0
+
+                # Split this group's frequencies into chunks for parallel workers
+                n_sub = len(idxs)
+                n_chunks = min(self.n_workers, n_sub)
+                if n_chunks < 1:
+                    n_chunks = 1
+                chunk_splits = np.array_split(np.arange(n_sub), n_chunks)
+
+                worker_args = [
+                    (self.lens, rs_unit, w_unit, y_vec, w_sub[ch], nu, self.tol,
+                     self.min_physical_radius, n_gl_for_worker,
+                     self.window_potential, self.window_radius_fraction,
+                     self.window_u, self.window_u_width, self.use_tail_correction)
+                    for ch in chunk_splits
+                    if len(ch) > 0
+                ]
+                # Track which global indices each chunk covers
+                valid_chunks = [ch for ch in chunk_splits if len(ch) > 0]
+
+                dispatch_start = time.perf_counter()
+                if self.n_workers == 1:
+                    results = [_nufht_batch_worker(a) for a in worker_args]
+                else:
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=self.n_workers
+                    ) as executor:
+                        results = list(executor.map(_nufht_batch_worker, worker_args))
+                dispatch_end = time.perf_counter()
+                dispatch_time += dispatch_end - dispatch_start
+
+                # Assemble results for this group
+                assembly_start = time.perf_counter()
+                for ch, (G_re, G_im) in zip(valid_chunks, results):
+                    for j, sub_j in enumerate(ch):
+                        i = idxs[sub_j]
+                        w = w_vec[i]
+                        g = G_re[:, j] + 1j * G_im[:, j]
+                        F[i, :] = np.exp(1j * w * quad_phase) * (w / 1j) * g
+                        if self.use_tail_correction:
+                            F[i, :] = 1.0 + F[i, :]
+                assembly_end = time.perf_counter()
+                assembly_time += assembly_end - assembly_start
+
+        t_end = time.perf_counter()
+
+        # ───────────────────────────────
+        # Timing breakdown
+        # ───────────────────────────────
+        if self.print_timing:
+            total_time = t_end - t0
+            setup_time = setup_end - setup_start
+            n_groups = len(group_items)
+            accounted = setup_time + gl_load_time + dispatch_time + assembly_time
+            unaccounted = total_time - accounted
+
+            print()
+            print("────────────────────────────────────────────────────────────")
+            print(" FresnelNUFHTBatched Timing")
+            print("────────────────────────────────────────────────────────────")
+            print(tracker.report("  CPU usage summary"))
+            print()
+
+            print(f"  Configuration: {n_w} frequencies, {n_y} output radii, "
+                  f"{n_groups} GL group(s), {self.n_workers} worker(s)")
+            print()
+
+            print("  Phase breakdown")
+            print("  ───────────────")
+            print(f"    0. Setup (grouping, allocation)  : "
+                  f"{_pct(setup_time, total_time):6.2f}%  ({setup_time:10.6f} s)")
+            print(f"    1. GL node loading               : "
+                  f"{_pct(gl_load_time, total_time):6.2f}%  ({gl_load_time:10.6f} s)")
+            print(f"    2. Worker dispatch + execution   : "
+                  f"{_pct(dispatch_time, total_time):6.2f}%  ({dispatch_time:10.6f} s)")
+            print(f"    3. Result assembly               : "
+                  f"{_pct(assembly_time, total_time):6.2f}%  ({assembly_time:10.6f} s)")
+            print(f"    4. Unaccounted / overhead        : "
+                  f"{_pct(unaccounted, total_time):6.2f}%  ({unaccounted:10.6f} s)")
+            print("────────────────────────────────────────────────────────────")
+            print(f"  TOTAL                              : "
+                  f"{_pct(total_time, total_time):6.2f}%  ({total_time:10.6f} s)")
+            print("────────────────────────────────────────────────────────────")
+            print()
 
         return F
 
