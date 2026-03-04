@@ -143,6 +143,8 @@ def _nufht_batch_compute(lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol,
       ``nufht_batch`` once per bin when available.
     - Optimization 3: vectorised coefficient computation via broadcasting.
     - Optimization 8: numexpr for the phase-exponential evaluation.
+    - Optimization 9: real+imaginary vectorized NUFHT call (single
+      ``nufht_batch`` with 2× columns instead of two separate calls).
 
     Returns
     -------
@@ -190,29 +192,49 @@ def _nufht_batch_compute(lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol,
                 bin_idx = np.where(w_abs_q == abs_w)[0]
                 out_pts = abs_w * y_vec
                 if len(bin_idx) > 1:
-                    ck_bin_re = np.asfortranarray(ck_matrix[bin_idx, :].real.T)
-                    ck_bin_im = np.asfortranarray(ck_matrix[bin_idx, :].imag.T)
-                    G_re[:, bin_idx] = pn.nufht_batch(
-                        nu, xs, ck_bin_re, out_pts, tol=tol)
-                    G_im[:, bin_idx] = pn.nufht_batch(
-                        nu, xs, ck_bin_im, out_pts, tol=tol)
+                    # Optimization 9: real+imaginary vectorized NUFHT call.
+                    # Pack real and imaginary columns side-by-side so a single
+                    # nufht_batch call handles both transforms at once.
+                    ck_bin_re = ck_matrix[bin_idx, :].real.T  # (m, n_bin)
+                    ck_bin_im = ck_matrix[bin_idx, :].imag.T  # (m, n_bin)
+                    ck_both = np.asfortranarray(
+                        np.concatenate([ck_bin_re, ck_bin_im], axis=1))  # (m, 2*n_bin)
+                    g_both = pn.nufht_batch(
+                        nu, xs, ck_both, out_pts, tol=tol)   # (n_y, 2*n_bin)
+                    n_bin = len(bin_idx)
+                    G_re[:, bin_idx] = g_both[:, :n_bin]
+                    G_im[:, bin_idx] = g_both[:, n_bin:]
                 else:
                     j = bin_idx[0]
+                    # Optimization 9: real+imaginary vectorized NUFHT call.
+                    ck_both = np.asfortranarray(np.column_stack([
+                        ck_matrix[j].real,
+                        ck_matrix[j].imag,
+                    ]))  # (m, 2)
+                    g_both = pn.nufht_batch(
+                        nu, xs, ck_both, out_pts, tol=tol)   # (n_y, 2)
+                    G_re[:, j] = g_both[:, 0]
+                    G_im[:, j] = g_both[:, 1]
+        else:
+            for j in range(batch):
+                out_pts = w_abs[j] * y_vec
+                if _HAS_NUFHT_BATCH:
+                    # Optimization 9: real+imaginary vectorized NUFHT call.
+                    ck_both = np.asfortranarray(np.column_stack([
+                        ck_matrix[j].real,
+                        ck_matrix[j].imag,
+                    ]))  # (m, 2)
+                    g_both = pn.nufht_batch(
+                        nu, xs, ck_both, out_pts, tol=tol)   # (n_y, 2)
+                    G_re[:, j] = g_both[:, 0]
+                    G_im[:, j] = g_both[:, 1]
+                else:
                     G_re[:, j] = pn.nufht(
                         nu, xs, np.ascontiguousarray(ck_matrix[j].real),
                         out_pts, tol=tol)
                     G_im[:, j] = pn.nufht(
                         nu, xs, np.ascontiguousarray(ck_matrix[j].imag),
                         out_pts, tol=tol)
-        else:
-            for j in range(batch):
-                out_pts = w_abs[j] * y_vec
-                G_re[:, j] = pn.nufht(
-                    nu, xs, np.ascontiguousarray(ck_matrix[j].real),
-                    out_pts, tol=tol)
-                G_im[:, j] = pn.nufht(
-                    nu, xs, np.ascontiguousarray(ck_matrix[j].imag),
-                    out_pts, tol=tol)
 
     else:  # ── Adaptive mode: xs differs per frequency ────────────────────────
         for j, w in enumerate(w_chunk):
@@ -248,8 +270,17 @@ def _nufht_batch_compute(lens, rs_unit, w_unit, y_vec, w_chunk, nu, tol,
 
             ck = x_weights * fw
             out_pts = abs(w) * y_vec
-            G_re[:, j] = pn.nufht(nu, xs, ck.real.copy(), out_pts, tol=tol)
-            G_im[:, j] = pn.nufht(nu, xs, ck.imag.copy(), out_pts, tol=tol)
+            if _HAS_NUFHT_BATCH:
+                # Optimization 9: real+imaginary vectorized NUFHT call.
+                ck_both = np.asfortranarray(
+                    np.column_stack([ck.real, ck.imag]))  # (m, 2)
+                g_both = pn.nufht_batch(
+                    nu, xs, ck_both, out_pts, tol=tol)    # (n_y, 2)
+                G_re[:, j] = g_both[:, 0]
+                G_im[:, j] = g_both[:, 1]
+            else:
+                G_re[:, j] = pn.nufht(nu, xs, ck.real.copy(), out_pts, tol=tol)
+                G_im[:, j] = pn.nufht(nu, xs, ck.imag.copy(), out_pts, tol=tol)
 
     return G_re, G_im
 
@@ -632,10 +663,19 @@ class FresnelNUFHT:
             for i in range(n_w):
                 xs_i = xs_per_freq[i]
                 out_pts = abs(w_vec[i]) * y_vec
-                # Call C NUFHT for real part
-                g_re[i, :] = _c_nufht(nu, xs_i, c_re[i, :], out_pts)
-                # Call C NUFHT for imaginary part
-                g_im[i, :] = _c_nufht(nu, xs_i, c_im[i, :], out_pts)
+                if _HAS_NUFHT_BATCH:
+                    # Optimization 9: real+imaginary vectorized NUFHT call.
+                    ck_both = np.asfortranarray(
+                        np.column_stack([c_re[i, :], c_im[i, :]]))  # (m, 2)
+                    g_both = _pn_module.nufht_batch(
+                        nu, xs_i, ck_both, out_pts)       # (n_y, 2)
+                    g_re[i, :] = g_both[:, 0]
+                    g_im[i, :] = g_both[:, 1]
+                else:
+                    # Call C NUFHT for real part
+                    g_re[i, :] = _c_nufht(nu, xs_i, c_re[i, :], out_pts)
+                    # Call C NUFHT for imaginary part
+                    g_im[i, :] = _c_nufht(nu, xs_i, c_im[i, :], out_pts)
             nufht_call_end = time.perf_counter()
             step2_end = nufht_call_end
 
@@ -1383,10 +1423,19 @@ class FresnelHankelAxisymmetricTrapezoidal:
             for i in range(n_w):
                 xs_i = xs_per_freq[i]
                 out_pts = abs(w_vec[i]) * y_vec
-                # Call C NUFHT for real part
-                g_re[i, :] = _c_nufht(nu, xs_i, all_c_re[i], out_pts)
-                # Call C NUFHT for imaginary part
-                g_im[i, :] = _c_nufht(nu, xs_i, all_c_im[i], out_pts)
+                if _HAS_NUFHT_BATCH:
+                    # Optimization 9: real+imaginary vectorized NUFHT call.
+                    ck_both = np.asfortranarray(
+                        np.column_stack([all_c_re[i], all_c_im[i]]))  # (m, 2)
+                    g_both = _pn_module.nufht_batch(
+                        nu, xs_i, ck_both, out_pts)        # (n_y, 2)
+                    g_re[i, :] = g_both[:, 0]
+                    g_im[i, :] = g_both[:, 1]
+                else:
+                    # Call C NUFHT for real part
+                    g_re[i, :] = _c_nufht(nu, xs_i, all_c_re[i], out_pts)
+                    # Call C NUFHT for imaginary part
+                    g_im[i, :] = _c_nufht(nu, xs_i, all_c_im[i], out_pts)
             nufht_call_end = time.perf_counter()
 
             t2 = nufht_call_end
