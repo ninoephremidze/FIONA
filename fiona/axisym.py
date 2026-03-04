@@ -195,17 +195,27 @@ class FresnelNUFHT:
     ----------
     lens : AxisymmetricLens
         Axisymmetric lens object with psi_r method.
-    gl_nodes_per_dim : int
-        Number of Gauss-Legendre nodes per dimension.
-    min_physical_radius : float
-        Minimum physical radius (Xmax) to use.
-    auto_R_from_gl_nodes : bool
-        If True, adapt Xmax based on frequency range.
+    gl_nodes_per_dim : int, optional
+        Number of Gauss-Legendre nodes per dimension (default 128).
+    min_physical_radius : float, optional
+        Minimum physical radius (Xmax) to use (default 1.0).
+    auto_R_from_gl_nodes : bool, optional
+        If True (default), adapt Xmax based on frequency range.
         If False, use fixed min_physical_radius.
-    gl_dir : str or None
+    gl_dir : str or None, optional
         Directory for GL node files. If None, uses FIONA_GL2D_DIR env var.
-    tol : float
-        Tolerance for NUFHT.
+    tol : float, optional
+        Tolerance for NUFHT (default 1e-12).
+    window_potential : bool, optional
+        If True (default), apply a smooth taper to the lens potential near Xmax.
+    window_radius_fraction : float, optional
+        Fractional radius at which the potential window starts (default 0.75).
+    window_u : bool, optional
+        If True (default), apply a smooth taper to the quadrature weights near Xmax.
+    window_u_width : float, optional
+        Fractional width of the weight taper (default 0.02).
+    use_tail_correction : bool, optional
+        If True (default), subtract the free-space tail from the integrand.
     """
 
     def __init__(self,
@@ -219,10 +229,7 @@ class FresnelNUFHT:
                  window_radius_fraction: float = 0.75,
                  window_u: bool = True,
                  window_u_width: float = 0.02,
-                 use_tail_correction: bool = True,
-                 # Deprecated parameters for backward compatibility
-                 n_gl: int = None,
-                 Umax: float = None):
+                 use_tail_correction: bool = True):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelHankelAxisymmetric requires AxisymmetricLens")
@@ -231,20 +238,6 @@ class FresnelNUFHT:
             raise ImportError("NUFHT C extension (_pynufht) cannot be loaded: "
                               f"{_FHT_ERR!r}")
 
-        # Handle backward compatibility for old parameter names
-        if n_gl is not None:
-            if gl_nodes_per_dim is not None:
-                raise ValueError("Cannot specify both n_gl and gl_nodes_per_dim")
-            gl_nodes_per_dim = n_gl
-        if Umax is not None:
-            if min_physical_radius is not None:
-                raise ValueError("Cannot specify both Umax and min_physical_radius")
-            min_physical_radius = Umax
-            # If old Umax is specified, default to no auto-adaptation for backward compat
-            if n_gl is not None:  # Both old params specified
-                auto_R_from_gl_nodes = False
-
-        # Set defaults if still None
         if gl_nodes_per_dim is None:
             gl_nodes_per_dim = 128
         if min_physical_radius is None:
@@ -855,16 +848,26 @@ class FresnelHankelAxisymmetricTrapezoidal:
     ----------
     lens : AxisymmetricLens
         Axisymmetric lens object with psi_r method.
-    n_r : int
-        Number of radial grid points.
-    min_physical_radius : float
-        Minimum physical radius (Xmax) to use.
-    auto_R_from_gl_nodes : bool
+    n_r : int, optional
+        Number of radial grid points (default 1024).
+    min_physical_radius : float, optional
+        Minimum physical radius (Xmax) to use (default 50.0).
+    auto_R_from_gl_nodes : bool, optional
         If True, adapt Xmax based on frequency range.
-        If False, use fixed min_physical_radius.
+        If False (default), use fixed min_physical_radius.
         Note: For this class we use n_r instead of gl_nodes_per_dim in the formula.
-    tol : float
-        Tolerance for NUFHT.
+    tol : float, optional
+        Tolerance for NUFHT (default 1e-12).
+    window_potential : bool, optional
+        If True (default), apply a smooth taper to the lens potential near Xmax.
+    window_radius_fraction : float, optional
+        Fractional radius at which the potential window starts (default 0.75).
+    window_u : bool, optional
+        If True (default), apply a smooth taper to the quadrature weights near Xmax.
+    window_u_width : float, optional
+        Fractional width of the weight taper (default 0.02).
+    use_tail_correction : bool, optional
+        If True (default), subtract the free-space tail from the integrand.
     """
 
     def __init__(self, lens: AxisymmetricLens,
@@ -876,9 +879,7 @@ class FresnelHankelAxisymmetricTrapezoidal:
                  window_radius_fraction: float = 0.75,
                  window_u: bool = True,
                  window_u_width: float = 0.02,
-                 use_tail_correction: bool = True,
-                 # Deprecated parameter for backward compatibility
-                 Umax: float = None):
+                 use_tail_correction: bool = True):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError(
@@ -891,15 +892,6 @@ class FresnelHankelAxisymmetricTrapezoidal:
                 f"Original import error: {_FHT_ERR!r}"
             )
 
-        # Handle backward compatibility for old parameter name
-        if Umax is not None:
-            if min_physical_radius is not None:
-                raise ValueError("Cannot specify both Umax and min_physical_radius")
-            min_physical_radius = Umax
-            # If old Umax is specified, default to no auto-adaptation for backward compat
-            auto_R_from_gl_nodes = False
-
-        # Set default if still None
         if min_physical_radius is None:
             min_physical_radius = 50.0
 
@@ -1182,17 +1174,27 @@ class FresnelHankelAxisymmetricSciPy:
     ----------
     lens : AxisymmetricLens
         Axisymmetric lens object with psi_r method.
-    gl_nodes_per_dim : int
-        Number of Gauss-Legendre nodes per dimension.
-    min_physical_radius : float
-        Minimum physical radius (Xmax) to use.
-    auto_R_from_gl_nodes : bool
-        If True, adapt Xmax based on frequency range.
+    gl_nodes_per_dim : int, optional
+        Number of Gauss-Legendre nodes per dimension (default 128).
+    min_physical_radius : float, optional
+        Minimum physical radius (Xmax) to use (default 1.0).
+    auto_R_from_gl_nodes : bool, optional
+        If True (default), adapt Xmax based on frequency range.
         If False, use fixed min_physical_radius.
-    gl_dir : str or None
+    gl_dir : str or None, optional
         Directory for GL node files. If None, uses FIONA_GL2D_DIR env var.
-    tol : float
-        Tolerance for computation.
+    tol : float, optional
+        Tolerance for computation (default 1e-12).
+    window_potential : bool, optional
+        If True (default), apply a smooth taper to the lens potential near Xmax.
+    window_radius_fraction : float, optional
+        Fractional radius at which the potential window starts (default 0.75).
+    window_u : bool, optional
+        If True (default), apply a smooth taper to the quadrature weights near Xmax.
+    window_u_width : float, optional
+        Fractional width of the weight taper (default 0.02).
+    use_tail_correction : bool, optional
+        If True (default), subtract the free-space tail from the integrand.
     """
 
     def __init__(self,
@@ -1206,10 +1208,7 @@ class FresnelHankelAxisymmetricSciPy:
                  window_radius_fraction: float = 0.75,
                  window_u: bool = True,
                  window_u_width: float = 0.02,
-                 use_tail_correction: bool = True,
-                 # Deprecated parameters for backward compatibility
-                 n_gl: int = None,
-                 Umax: float = None):
+                 use_tail_correction: bool = True):
 
         if not isinstance(lens, AxisymmetricLens):
             raise TypeError("FresnelHankelAxisymmetricSciPy requires AxisymmetricLens")
@@ -1220,20 +1219,6 @@ class FresnelHankelAxisymmetricSciPy:
                 f"Original import error: {_SCIPY_FHT_ERR!r}"
             )
 
-        # Handle backward compatibility for old parameter names
-        if n_gl is not None:
-            if gl_nodes_per_dim is not None:
-                raise ValueError("Cannot specify both n_gl and gl_nodes_per_dim")
-            gl_nodes_per_dim = n_gl
-        if Umax is not None:
-            if min_physical_radius is not None:
-                raise ValueError("Cannot specify both Umax and min_physical_radius")
-            min_physical_radius = Umax
-            # If old Umax is specified, default to no auto-adaptation for backward compat
-            if n_gl is not None:  # Both old params specified
-                auto_R_from_gl_nodes = False
-
-        # Set defaults if still None
         if gl_nodes_per_dim is None:
             gl_nodes_per_dim = 128
         if min_physical_radius is None:
