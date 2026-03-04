@@ -1074,8 +1074,9 @@ class FresnelNUFHTBatched:
         if np.any(w_vec == 0):
             raise ValueError("All w must be nonzero.")
 
-        # Declare module-level context variable for worker sharing (Optimization 2).
+        # Declare module-level context variables for worker sharing (Optimizations 2, 10).
         global _AXISYM_WORKER_CTX
+        global _AXISYM_WORKER_CTX_LIST
 
         n_w = len(w_vec)
         n_y = len(y_vec)
