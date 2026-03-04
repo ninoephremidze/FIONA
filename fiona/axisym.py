@@ -74,6 +74,10 @@ def _axisym_set_thread_env(nthreads):
 # passed explicitly via initargs when using the "spawn" start method.
 _AXISYM_WORKER_CTX = None
 
+# Module-level list of per-group contexts (Optimization 10: cross-group parallelism).
+# Allows all GL groups to be dispatched in a single pool rather than sequentially.
+_AXISYM_WORKER_CTX_LIST = None
+
 
 def _init_axisym_worker(ctx=None):
     """
@@ -93,6 +97,55 @@ def _init_axisym_worker(ctx=None):
             _ne.set_num_threads(1)
         except Exception:
             pass
+
+
+def _init_axisym_worker_multi(ctx_list=None):
+    """
+    Initialise per-process state for multi-group axisym worker processes.
+
+    Stores the full list of per-group context dicts as a module-level
+    global so that each worker can look up its group's shared data by
+    index (Optimization 10).  Thread-pinning mirrors ``_init_axisym_worker``.
+    """
+    global _AXISYM_WORKER_CTX_LIST
+    if ctx_list is not None:
+        _AXISYM_WORKER_CTX_LIST = ctx_list
+    _axisym_set_thread_env(1)
+    if _HAS_NUMEXPR:
+        try:
+            _ne.set_num_threads(1)
+        except Exception:
+            pass
+
+
+def _axisym_batch_task_multi(task):
+    """
+    Multi-group context-aware worker entry-point (Optimization 10).
+
+    Takes a task tuple ``(group_idx, w_indices)`` and looks up the
+    corresponding group context from the module-level
+    ``_AXISYM_WORKER_CTX_LIST``.  Only the tiny index array ``w_indices``
+    traverses IPC; all large quadrature arrays are inherited via fork
+    copy-on-write (or pre-set via the pool initializer on spawn systems).
+
+    Returns
+    -------
+    group_idx, w_indices, G_re, G_im
+        ``group_idx`` and ``w_indices`` echoed back so the caller can
+        assemble results in any order (compatible with ``imap_unordered``).
+    """
+    group_idx, w_indices = task
+    ctx = _AXISYM_WORKER_CTX_LIST[group_idx]
+    w_chunk = ctx["w_vec"][w_indices]
+    G_re, G_im = _nufht_batch_compute(
+        ctx["lens"], ctx["rs_unit"], ctx["w_unit"], ctx["y_vec"],
+        w_chunk, ctx["nu"], ctx["tol"], ctx["min_physical_radius"],
+        ctx["n_gl"], ctx["window_potential"], ctx["window_radius_fraction"],
+        ctx["window_u"], ctx["window_u_width"], ctx["use_tail_correction"],
+        xs_fixed=ctx.get("xs_fixed"),
+        x_weights_fixed=ctx.get("x_weights_fixed"),
+        integrand_phase_fixed=ctx.get("integrand_phase_fixed"))
+    return group_idx, w_indices, G_re, G_im
 
 
 def _window_taper_1d(r, R, frac):
@@ -1055,7 +1108,7 @@ class FresnelNUFHTBatched:
                 group_items = [(self.gl_nodes_per_dim, np.arange(n_w, dtype=int))]
             setup_end = time.perf_counter()
 
-            # Accumulators for per-group phases
+            # Accumulators for phases
             gl_load_time = 0.0
             dispatch_time = 0.0
             assembly_time = 0.0
@@ -1068,15 +1121,17 @@ class FresnelNUFHTBatched:
                 _mp_fork_ctx = mp.get_context()
                 _axisym_mp_method = "spawn"
 
+            # ── Phase A: Build all group contexts (GL nodes + fixed-mode precompute) ──
+            # Optimization 10: collect all groups before dispatching so that every
+            # group can be submitted to a *single* pool, allowing cores to be spread
+            # evenly across groups rather than saturating one group at a time.
+            gl_start = time.perf_counter()
+            group_ctxs = []  # list of (global_idxs, ctx_dict)
             for n_gl, idxs in group_items:
                 w_sub = w_vec[idxs]
-                n_sub = len(idxs)
 
                 # Load GL nodes on the unit interval [-1, 1] once per group.
-                gl_start = time.perf_counter()
                 rs_unit, w_unit = self._load_gl_nodes_unit(n_gl)
-                gl_end = time.perf_counter()
-                gl_load_time += gl_end - gl_start
 
                 # n_gl_for_worker > 0 enables per-frequency Xmax adaptation;
                 # 0 signals fixed mode (Xmax = min_physical_radius for all w).
@@ -1116,58 +1171,77 @@ class FresnelNUFHTBatched:
                     ctx["x_weights_fixed"] = xw_f
                     ctx["integrand_phase_fixed"] = 0.5 * xs_f ** 2 - psi_f
 
-                # Split this group's frequencies into chunks for parallel workers
-                n_chunks = max(1, min(self.n_workers, n_sub))
+                group_ctxs.append((idxs, ctx))
+            gl_end = time.perf_counter()
+            gl_load_time = gl_end - gl_start
+
+            # ── Phase B: Build all tasks across every group (Optimization 10) ──
+            # Distribute n_workers cores evenly across the GL groups so that all
+            # groups execute in parallel.  Each core receives a contiguous slice of
+            # a group's frequencies and evaluates them in a single batched NUFHT call.
+            n_groups = len(group_ctxs)
+            workers_per_group = max(1, self.n_workers // n_groups)
+
+            all_tasks = []   # list of (group_idx, w_indices_within_group)
+            for group_idx, (idxs, _ctx) in enumerate(group_ctxs):
+                n_sub = len(idxs)
+                n_chunks = max(1, min(workers_per_group, n_sub))
                 chunk_splits = np.array_split(np.arange(n_sub), n_chunks)
-                tasks = [ch for ch in chunk_splits if len(ch) > 0]
+                for ch in chunk_splits:
+                    if len(ch) > 0:
+                        all_tasks.append((group_idx, ch))
 
-                # Optimization 2: fork-based Pool replaces ProcessPoolExecutor.
-                dispatch_start = time.perf_counter()
-                if self.n_workers == 1:
-                    _AXISYM_WORKER_CTX = ctx
-                    _init_axisym_worker()
-                    results_raw = [_axisym_batch_task(ch) for ch in tasks]
+            ctx_list = [ctx for _, ctx in group_ctxs]
+
+            # ── Phase C: Dispatch all tasks in one pool (Optimization 2 + 10) ──
+            dispatch_start = time.perf_counter()
+            total_pool_workers = min(len(all_tasks), self.n_workers)
+            if total_pool_workers <= 1:
+                _AXISYM_WORKER_CTX_LIST = ctx_list
+                _init_axisym_worker_multi()
+                results_raw = [_axisym_batch_task_multi(t) for t in all_tasks]
+            else:
+                if _axisym_mp_method == "fork":
+                    _AXISYM_WORKER_CTX_LIST = ctx_list
+                    _init_axisym_worker_multi()
+                    pool = _mp_fork_ctx.Pool(
+                        processes=total_pool_workers,
+                        initializer=_init_axisym_worker_multi)
                 else:
-                    if _axisym_mp_method == "fork":
-                        _AXISYM_WORKER_CTX = ctx
-                        _init_axisym_worker()
-                        pool = _mp_fork_ctx.Pool(
-                            processes=self.n_workers,
-                            initializer=_init_axisym_worker)
-                    else:
-                        pool = _mp_fork_ctx.Pool(
-                            processes=self.n_workers,
-                            initializer=_init_axisym_worker,
-                            initargs=(ctx,))
-                    try:
-                        results_raw = list(pool.imap_unordered(
-                            _axisym_batch_task, tasks, chunksize=1))
-                    finally:
-                        pool.close()
-                        pool.join()
-                dispatch_end = time.perf_counter()
-                dispatch_time += dispatch_end - dispatch_start
+                    pool = _mp_fork_ctx.Pool(
+                        processes=total_pool_workers,
+                        initializer=_init_axisym_worker_multi,
+                        initargs=(ctx_list,))
+                try:
+                    results_raw = list(pool.imap_unordered(
+                        _axisym_batch_task_multi, all_tasks, chunksize=1))
+                finally:
+                    pool.close()
+                    pool.join()
+            dispatch_end = time.perf_counter()
+            dispatch_time = dispatch_end - dispatch_start
 
-                # Optimization 5: vectorised result assembly.
-                assembly_start = time.perf_counter()
-                for w_indices, G_re, G_im in results_raw:
-                    global_indices = idxs[w_indices]
-                    w_chunk = w_sub[w_indices]
-                    w_col = w_chunk[:, np.newaxis]          # (batch, 1)
-                    g_T = (G_re + 1j * G_im).T             # (batch, n_y)
-                    if _HAS_NUMEXPR:
-                        phase_arg = w_col * quad_phase[np.newaxis, :]
-                        cos_p = _ne.evaluate("cos(phase_arg)")
-                        sin_p = _ne.evaluate("sin(phase_arg)")
-                        phase = cos_p + 1j * sin_p
-                    else:
-                        phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
-                    chunk_F = phase * (w_col / 1j) * g_T   # (batch, n_y)
-                    if self.use_tail_correction:
-                        chunk_F += 1.0
-                    F[global_indices, :] = chunk_F
-                assembly_end = time.perf_counter()
-                assembly_time += assembly_end - assembly_start
+            # ── Phase D: Assemble results (Optimization 5) ──
+            assembly_start = time.perf_counter()
+            for group_idx, w_indices, G_re, G_im in results_raw:
+                idxs = group_ctxs[group_idx][0]
+                global_indices = idxs[w_indices]
+                w_chunk = w_vec[global_indices]
+                w_col = w_chunk[:, np.newaxis]          # (batch, 1)
+                g_T = (G_re + 1j * G_im).T             # (batch, n_y)
+                if _HAS_NUMEXPR:
+                    phase_arg = w_col * quad_phase[np.newaxis, :]
+                    cos_p = _ne.evaluate("cos(phase_arg)")
+                    sin_p = _ne.evaluate("sin(phase_arg)")
+                    phase = cos_p + 1j * sin_p
+                else:
+                    phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
+                chunk_F = phase * (w_col / 1j) * g_T   # (batch, n_y)
+                if self.use_tail_correction:
+                    chunk_F += 1.0
+                F[global_indices, :] = chunk_F
+            assembly_end = time.perf_counter()
+            assembly_time = assembly_end - assembly_start
 
         t_end = time.perf_counter()
 
@@ -1177,7 +1251,7 @@ class FresnelNUFHTBatched:
         if self.print_timing:
             total_time = t_end - t0
             setup_time = setup_end - setup_start
-            n_groups = len(group_items)
+            n_groups = len(group_ctxs)
             accounted = setup_time + gl_load_time + dispatch_time + assembly_time
             unaccounted = total_time - accounted
 
@@ -1189,7 +1263,8 @@ class FresnelNUFHTBatched:
             print()
 
             print(f"  Configuration: {n_w} frequencies, {n_y} output radii, "
-                  f"{n_groups} GL group(s), {self.n_workers} worker(s)")
+                  f"{n_groups} GL group(s), {self.n_workers} worker(s) total "
+                  f"({workers_per_group} per group, {total_pool_workers} active)")
             print()
 
             print("  Phase breakdown")
