@@ -42,7 +42,6 @@ except Exception as e:
     _HAS_NUFHT_BATCH = False
     _NUFHT_BATCH_ERR = e
 
-import concurrent.futures
 import multiprocessing as mp
 
 # Optional numexpr for vectorised phase-exponential computation (Optimization 8).
@@ -330,22 +329,64 @@ def _nufht_batch_worker(args):
         integrand_phase_fixed=integrand_phase_fixed)
 
 
-def _axisym_batch_task(w_indices):
+def _axisym_make_group_tasks(group_sizes, n_workers):
+    """
+    Build grouped frequency tasks for axisymmetric batched dispatch.
+
+    Each GL group receives roughly ``n_workers // n_groups`` chunks so that
+    groups can run concurrently while still batching multiple frequencies per
+    worker task.
+
+    Parameters
+    ----------
+    group_sizes : sequence of int
+        Number of frequencies in each GL group.
+    n_workers : int
+        Total worker budget.
+
+    Returns
+    -------
+    tasks : list[tuple[int, ndarray]]
+        Tuples ``(group_id, local_indices)`` where ``local_indices`` are
+        indices into that group's local ``w_vec``.
+    workers_per_group : int
+        Nominal per-group worker budget used for splitting.
+    """
+    n_groups = len(group_sizes)
+    if n_groups == 0:
+        return [], 0
+
+    workers_per_group = max(1, int(n_workers) // n_groups)
+    tasks = []
+    for group_id, n_sub in enumerate(group_sizes):
+        n_sub = int(n_sub)
+        if n_sub <= 0:
+            continue
+        n_chunks = max(1, min(n_sub, workers_per_group))
+        local_splits = np.array_split(np.arange(n_sub, dtype=int), n_chunks)
+        for local_indices in local_splits:
+            if len(local_indices) > 0:
+                tasks.append((group_id, local_indices))
+    return tasks, workers_per_group
+
+
+def _axisym_batch_task(task):
     """
     Context-aware worker entry-point for fork / spawn Pool dispatch.
 
     Reads all shared data from the module-level ``_AXISYM_WORKER_CTX``
     (set by the parent before forking, or passed via the pool initializer
-    for spawn).  Only ``w_indices`` — indices into the context's ``w_vec``
-    — are transferred per task, minimising pickle payload (Optimization 7).
+    for spawn).  Only ``task = (group_id, w_indices)`` is transferred per
+    task, minimising pickle payload (Optimization 7).
 
     Returns
     -------
-    w_indices, G_re, G_im
-        ``w_indices`` echoed back so the caller can assemble results in any
-        order (compatible with ``imap_unordered``).
+    group_id, w_indices, G_re, G_im
+        ``group_id`` and ``w_indices`` are echoed back so the caller can
+        assemble results in any order (compatible with ``imap_unordered``).
     """
-    ctx = _AXISYM_WORKER_CTX
+    group_id, w_indices = task
+    ctx = _AXISYM_WORKER_CTX["groups"][group_id]
     w_chunk = ctx["w_vec"][w_indices]
     G_re, G_im = _nufht_batch_compute(
         ctx["lens"], ctx["rs_unit"], ctx["w_unit"], ctx["y_vec"],
@@ -355,7 +396,7 @@ def _axisym_batch_task(w_indices):
         xs_fixed=ctx.get("xs_fixed"),
         x_weights_fixed=ctx.get("x_weights_fixed"),
         integrand_phase_fixed=ctx.get("integrand_phase_fixed"))
-    return w_indices, G_re, G_im
+    return group_id, w_indices, G_re, G_im
 
 
 def _pct(part, total):
@@ -839,10 +880,12 @@ class FresnelNUFHTBatched:
     Instead of iterating over frequencies one at a time (as in
     :class:`FresnelNUFHT`), this implementation:
 
-    1. Splits ``w_vec`` into up to ``n_workers`` chunks.
-    2. Dispatches each chunk to a subprocess via
-       ``concurrent.futures.ProcessPoolExecutor``.
-    3. Within each subprocess a *single* ``nufht_batch`` call is made for
+    1. Groups frequencies by GL quadrature (`n_gl`) when ``adaptive_n_gl=True``.
+    2. Further splits each GL group into subgroup chunks, with roughly
+       ``n_workers // n_groups`` chunks per group.
+    3. Dispatches all subgroup chunks through a shared process pool so
+       different GL groups run concurrently.
+    4. Within each subprocess a *single* ``nufht_batch`` call is made for
        the real coefficients and a *single* call for the imaginary
        coefficients (two calls total per worker-chunk).
 
@@ -851,7 +894,7 @@ class FresnelNUFHTBatched:
     - ``_pynufht`` must expose ``nufht_batch``.  If only ``nufht`` is
       available, use :class:`FresnelNUFHT` instead.
     - The ``lens`` object must be **pickleable** (required for
-      ``ProcessPoolExecutor``).  If your lens is not pickleable you can
+      multiprocessing workers).  If your lens is not pickleable you can
       set ``n_workers=1``, which runs the computation in the current
       process and avoids pickling entirely.
 
@@ -880,7 +923,7 @@ class FresnelNUFHTBatched:
         Tolerance passed to ``nufht_batch`` (default ``1e-12``).
     n_workers : int, optional
         Number of parallel worker processes (default 112).  Set to 1
-        to run in-process without a ``ProcessPoolExecutor``.
+        to run in-process without multiprocessing.
     print_timing : bool, optional
         If ``True`` (default), print a timing/performance summary after each
         ``__call__`` invocation, including total runtime and a breakdown of
@@ -1040,7 +1083,7 @@ class FresnelNUFHTBatched:
             F = np.empty((n_w, n_y), dtype=np.complex128)
             quad_phase = 0.5 * y_vec ** 2
 
-            # Group frequencies by n_gl bin (adaptive) or use a single group (fixed)
+            # Group frequencies by n_gl bin (adaptive) or use a single group (fixed).
             if self.adaptive_n_gl:
                 w_abs = np.abs(w_vec)
                 n_gl_vec = np.array([_adaptive_n_gl(v) for v in w_abs], dtype=int)
@@ -1053,9 +1096,16 @@ class FresnelNUFHTBatched:
                 ]
             else:
                 group_items = [(self.gl_nodes_per_dim, np.arange(n_w, dtype=int))]
+
+            # Split each GL group into sub-groups that can run concurrently.
+            # Example: 10 GL groups and 112 workers -> 11 chunks per group.
+            effective_n_workers = max(1, self.n_workers)
+            group_sizes = [len(idxs) for _, idxs in group_items]
+            tasks, workers_per_group = _axisym_make_group_tasks(
+                group_sizes, effective_n_workers)
             setup_end = time.perf_counter()
 
-            # Accumulators for per-group phases
+            # Accumulators for major phases.
             gl_load_time = 0.0
             dispatch_time = 0.0
             assembly_time = 0.0
@@ -1068,9 +1118,10 @@ class FresnelNUFHTBatched:
                 _mp_fork_ctx = mp.get_context()
                 _axisym_mp_method = "spawn"
 
+            # Build one context per GL group and keep all groups available to workers.
+            group_contexts = []
             for n_gl, idxs in group_items:
                 w_sub = w_vec[idxs]
-                n_sub = len(idxs)
 
                 # Load GL nodes on the unit interval [-1, 1] once per group.
                 gl_start = time.perf_counter()
@@ -1099,6 +1150,7 @@ class FresnelNUFHTBatched:
                     "window_u_width": self.window_u_width,
                     "use_tail_correction": self.use_tail_correction,
                 }
+
                 # Optimization 7: precompute fixed-mode quantities in the parent
                 # so workers need not call lens.psi_r at all.
                 if n_gl_for_worker == 0:
@@ -1116,58 +1168,64 @@ class FresnelNUFHTBatched:
                     ctx["x_weights_fixed"] = xw_f
                     ctx["integrand_phase_fixed"] = 0.5 * xs_f ** 2 - psi_f
 
-                # Split this group's frequencies into chunks for parallel workers
-                n_chunks = max(1, min(self.n_workers, n_sub))
-                chunk_splits = np.array_split(np.arange(n_sub), n_chunks)
-                tasks = [ch for ch in chunk_splits if len(ch) > 0]
+                group_contexts.append({
+                    "global_indices": idxs,
+                    "w_vec": w_sub,
+                    "ctx": ctx,
+                })
 
-                # Optimization 2: fork-based Pool replaces ProcessPoolExecutor.
-                dispatch_start = time.perf_counter()
-                if self.n_workers == 1:
-                    _AXISYM_WORKER_CTX = ctx
+            # Dispatch all GL-group sub-chunks through one shared worker pool.
+            dispatch_start = time.perf_counter()
+            results_raw = []
+            if len(tasks) > 0:
+                worker_ctx = {"groups": [item["ctx"] for item in group_contexts]}
+                if effective_n_workers == 1:
+                    _AXISYM_WORKER_CTX = worker_ctx
                     _init_axisym_worker()
-                    results_raw = [_axisym_batch_task(ch) for ch in tasks]
+                    results_raw = [_axisym_batch_task(task) for task in tasks]
                 else:
+                    n_pool_workers = min(effective_n_workers, len(tasks))
                     if _axisym_mp_method == "fork":
-                        _AXISYM_WORKER_CTX = ctx
+                        _AXISYM_WORKER_CTX = worker_ctx
                         _init_axisym_worker()
                         pool = _mp_fork_ctx.Pool(
-                            processes=self.n_workers,
+                            processes=n_pool_workers,
                             initializer=_init_axisym_worker)
                     else:
                         pool = _mp_fork_ctx.Pool(
-                            processes=self.n_workers,
+                            processes=n_pool_workers,
                             initializer=_init_axisym_worker,
-                            initargs=(ctx,))
+                            initargs=(worker_ctx,))
                     try:
                         results_raw = list(pool.imap_unordered(
                             _axisym_batch_task, tasks, chunksize=1))
                     finally:
                         pool.close()
                         pool.join()
-                dispatch_end = time.perf_counter()
-                dispatch_time += dispatch_end - dispatch_start
+            dispatch_end = time.perf_counter()
+            dispatch_time += dispatch_end - dispatch_start
 
-                # Optimization 5: vectorised result assembly.
-                assembly_start = time.perf_counter()
-                for w_indices, G_re, G_im in results_raw:
-                    global_indices = idxs[w_indices]
-                    w_chunk = w_sub[w_indices]
-                    w_col = w_chunk[:, np.newaxis]          # (batch, 1)
-                    g_T = (G_re + 1j * G_im).T             # (batch, n_y)
-                    if _HAS_NUMEXPR:
-                        phase_arg = w_col * quad_phase[np.newaxis, :]
-                        cos_p = _ne.evaluate("cos(phase_arg)")
-                        sin_p = _ne.evaluate("sin(phase_arg)")
-                        phase = cos_p + 1j * sin_p
-                    else:
-                        phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
-                    chunk_F = phase * (w_col / 1j) * g_T   # (batch, n_y)
-                    if self.use_tail_correction:
-                        chunk_F += 1.0
-                    F[global_indices, :] = chunk_F
-                assembly_end = time.perf_counter()
-                assembly_time += assembly_end - assembly_start
+            # Optimization 5: vectorised result assembly.
+            assembly_start = time.perf_counter()
+            for group_id, w_indices, G_re, G_im in results_raw:
+                group_meta = group_contexts[group_id]
+                global_indices = group_meta["global_indices"][w_indices]
+                w_chunk = group_meta["w_vec"][w_indices]
+                w_col = w_chunk[:, np.newaxis]          # (batch, 1)
+                g_T = (G_re + 1j * G_im).T             # (batch, n_y)
+                if _HAS_NUMEXPR:
+                    phase_arg = w_col * quad_phase[np.newaxis, :]
+                    cos_p = _ne.evaluate("cos(phase_arg)")
+                    sin_p = _ne.evaluate("sin(phase_arg)")
+                    phase = cos_p + 1j * sin_p
+                else:
+                    phase = np.exp(1j * w_col * quad_phase[np.newaxis, :])
+                chunk_F = phase * (w_col / 1j) * g_T   # (batch, n_y)
+                if self.use_tail_correction:
+                    chunk_F += 1.0
+                F[global_indices, :] = chunk_F
+            assembly_end = time.perf_counter()
+            assembly_time += assembly_end - assembly_start
 
         t_end = time.perf_counter()
 
@@ -1189,7 +1247,9 @@ class FresnelNUFHTBatched:
             print()
 
             print(f"  Configuration: {n_w} frequencies, {n_y} output radii, "
-                  f"{n_groups} GL group(s), {self.n_workers} worker(s)")
+                  f"{n_groups} GL group(s), {effective_n_workers} worker(s)")
+            print(f"                 {workers_per_group} subgroup worker(s) per GL group, "
+                  f"{len(tasks)} total subgroup task(s)")
             print()
 
             print("  Phase breakdown")
